@@ -1084,7 +1084,13 @@ impl Editor {
 
     fn draw_preview_line(&mut self, line: &str, width: usize) -> io::Result<()> {
         if self.preview_backend == PreviewBackend::Glow {
-            queue!(self.terminal.stdout, Print(line))
+            queue!(
+                self.terminal.stdout,
+                Print(line),
+                SetAttribute(Attribute::Reset),
+                SetBackgroundColor(CRT_BG),
+                SetForegroundColor(CRT_FG)
+            )
         } else {
             let clipped = clip_to_char_width(line, width);
             queue!(self.terminal.stdout, Print(clipped))
