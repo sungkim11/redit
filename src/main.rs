@@ -1,8 +1,10 @@
 use std::cmp;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{self, Stdout, Write, stdout};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -237,6 +239,7 @@ enum MenuAction {
     Paste,
     Find,
     Replace,
+    TogglePreview,
     Keybindings,
     About,
 }
@@ -309,11 +312,25 @@ const HELP_MENU_ENTRIES: &[MenuEntry] = &[
         action: MenuAction::Keybindings,
     },
     MenuEntry {
+        label: "Toggle Preview Ctrl+P",
+        mnemonic: 'p',
+        action: MenuAction::TogglePreview,
+    },
+    MenuEntry {
         label: "About redit",
         mnemonic: 'a',
         action: MenuAction::About,
     },
 ];
+
+const PREVIEW_MIN_TOTAL_WIDTH: usize = 50;
+const PREVIEW_SEPARATOR_WIDTH: usize = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewBackend {
+    Glow,
+    Fallback,
+}
 
 const CRT_BG: Color = Color::Rgb { r: 0, g: 12, b: 0 };
 const CRT_FG: Color = Color::Rgb {
@@ -391,6 +408,12 @@ struct Editor {
     status: StatusMessage,
     active_menu: Option<MenuKind>,
     active_menu_index: usize,
+    preview_mode: bool,
+    preview_cache_lines: Vec<String>,
+    preview_cache_width: usize,
+    preview_cache_revision: u64,
+    preview_backend: PreviewBackend,
+    preview_error: Option<String>,
     should_quit: bool,
     quit_warning_countdown: u8,
 }
@@ -408,9 +431,17 @@ impl Editor {
             doc,
             cursor: Position::default(),
             offset: Position::default(),
-            status: StatusMessage::new("Alt-F/E/S/H: menus | Ctrl-S save | Ctrl-Q quit | F1 help"),
+            status: StatusMessage::new(
+                "Alt-F/E/S/H: menus | Ctrl-S save | Ctrl-Q quit | Ctrl-P preview | F1 help",
+            ),
             active_menu: None,
             active_menu_index: 0,
+            preview_mode: false,
+            preview_cache_lines: Vec::new(),
+            preview_cache_width: 0,
+            preview_cache_revision: 0,
+            preview_backend: PreviewBackend::Fallback,
+            preview_error: None,
             should_quit: false,
             quit_warning_countdown: 1,
         })
@@ -521,6 +552,13 @@ impl Editor {
                 ..
             } if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.invoke_menu_action(MenuAction::Replace)
+            }
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.invoke_menu_action(MenuAction::TogglePreview)
             }
             KeyEvent {
                 code: KeyCode::F(1),
@@ -897,9 +935,10 @@ impl Editor {
             MenuAction::Replace => {
                 self.status = StatusMessage::new("Replace is not implemented yet.");
             }
+            MenuAction::TogglePreview => self.toggle_preview(),
             MenuAction::Keybindings => {
                 self.status = StatusMessage::new(
-                    "Menus: Alt-F/E/S/H, arrows, Enter, Esc. Shortcuts: Ctrl-S/Q/Z/Y/X/C/V/F/R.",
+                    "Menus: Alt-F/E/S/H, arrows, Enter, Esc. Shortcuts: Ctrl-S/Q/Z/Y/X/C/V/F/R/P.",
                 );
             }
             MenuAction::About => {
@@ -907,6 +946,161 @@ impl Editor {
                     StatusMessage::new("redit: terminal markup editor prototype in Rust.");
             }
         }
+    }
+
+    fn toggle_preview(&mut self) {
+        self.preview_mode = !self.preview_mode;
+        if self.preview_mode {
+            self.preview_cache_lines.clear();
+            self.preview_cache_width = 0;
+            self.preview_cache_revision = 0;
+            let (cols, _) = terminal::size().unwrap_or((80, 24));
+            if self.preview_layout(usize::from(cols)).is_some() {
+                self.status = StatusMessage::new("Preview enabled (Ctrl-P to hide).");
+            } else {
+                self.status =
+                    StatusMessage::new("Preview enabled. Widen terminal to show split preview.");
+            }
+        } else {
+            self.status = StatusMessage::new("Preview hidden.");
+        }
+        self.scroll();
+    }
+
+    fn preview_layout(&self, cols: usize) -> Option<(usize, usize, usize)> {
+        if !self.preview_mode {
+            return None;
+        }
+
+        let gutter = self.gutter_width();
+        let total_body = cols.saturating_sub(gutter);
+        if total_body < PREVIEW_MIN_TOTAL_WIDTH {
+            return None;
+        }
+
+        let editor_width = total_body.saturating_sub(PREVIEW_SEPARATOR_WIDTH) / 2;
+        let separator_x = gutter + editor_width;
+        let preview_x = separator_x + PREVIEW_SEPARATOR_WIDTH;
+        let preview_width = cols.saturating_sub(preview_x);
+        if editor_width == 0 || preview_width == 0 {
+            return None;
+        }
+        Some((separator_x, preview_x, preview_width))
+    }
+
+    fn editor_body_width(&self, cols: usize) -> usize {
+        let gutter = self.gutter_width();
+        if let Some((separator_x, _, _)) = self.preview_layout(cols) {
+            separator_x.saturating_sub(gutter)
+        } else {
+            cols.saturating_sub(gutter)
+        }
+    }
+
+    fn preview_revision(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.doc.lines.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn ensure_preview_cache(&mut self, width: usize) {
+        let revision = self.preview_revision();
+        if self.preview_cache_width == width && self.preview_cache_revision == revision {
+            return;
+        }
+
+        let (lines, backend, error) = self.build_preview_lines(width);
+        self.preview_cache_lines = lines;
+        self.preview_cache_width = width;
+        self.preview_cache_revision = revision;
+        self.preview_backend = backend;
+
+        if error != self.preview_error {
+            if let Some(err) = &error {
+                self.status = StatusMessage::new(err.clone());
+            }
+            self.preview_error = error;
+        }
+    }
+
+    fn build_preview_lines(&self, width: usize) -> (Vec<String>, PreviewBackend, Option<String>) {
+        if let Some(glow_path) = find_glow_command() {
+            match self.render_with_glow(&glow_path, width) {
+                Ok(lines) => return (lines, PreviewBackend::Glow, None),
+                Err(err) => {
+                    let lines = self.render_fallback_preview(width);
+                    return (
+                        lines,
+                        PreviewBackend::Fallback,
+                        Some(format!("Glow preview unavailable: {err}. Using fallback.")),
+                    );
+                }
+            }
+        }
+
+        (
+            self.render_fallback_preview(width),
+            PreviewBackend::Fallback,
+            Some("Glow not found. Install glow to enable GitHub-style preview.".to_string()),
+        )
+    }
+
+    fn render_with_glow(&self, glow_path: &Path, width: usize) -> Result<Vec<String>, String> {
+        let mut command = Command::new(glow_path);
+        command
+            .arg("-s")
+            .arg("dark")
+            .arg("-w")
+            .arg(width.to_string())
+            .arg("-");
+
+        let source = self.preview_source_text();
+        let output = run_command_with_stdin(&mut command, Some(source.as_bytes()))
+            .map_err(|err| err.to_string())?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(detail);
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let lines = text
+            .lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        Ok(lines)
+    }
+
+    fn render_fallback_preview(&self, width: usize) -> Vec<String> {
+        self.preview_source_lines()
+            .iter()
+            .map(|line| clip_to_char_width(line, width))
+            .collect()
+    }
+
+    fn draw_preview_line(&mut self, line: &str, width: usize) -> io::Result<()> {
+        if self.preview_backend == PreviewBackend::Glow {
+            queue!(self.terminal.stdout, Print(line))
+        } else {
+            let clipped = clip_to_char_width(line, width);
+            queue!(self.terminal.stdout, Print(clipped))
+        }
+    }
+
+    fn preview_source_lines(&self) -> Vec<String> {
+        self.doc
+            .lines
+            .iter()
+            .map(|line| html_heading_to_markdown(line).unwrap_or_else(|| line.clone()))
+            .collect()
+    }
+
+    fn preview_source_text(&self) -> String {
+        self.preview_source_lines().join("\n")
     }
 
     fn insert_char(&mut self, c: char) {
@@ -1025,9 +1219,9 @@ impl Editor {
 
     fn scroll(&mut self) {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let cols = usize::from(cols);
         let text_height = usize::from(rows.saturating_sub(3));
-        let gutter = self.gutter_width();
-        let text_width = usize::from(cols).saturating_sub(gutter);
+        let text_width = self.editor_body_width(cols);
 
         if self.cursor.y < self.offset.y {
             self.offset.y = self.cursor.y;
@@ -1102,7 +1296,11 @@ impl Editor {
         let cols_usize = usize::from(cols);
         let text_height = usize::from(rows.saturating_sub(3));
         let gutter = self.gutter_width();
-        let body_width = cols_usize.saturating_sub(gutter);
+        let body_width = self.editor_body_width(cols_usize);
+        let preview_layout = self.preview_layout(cols_usize);
+        if let Some((_, _, preview_width)) = preview_layout {
+            self.ensure_preview_cache(preview_width);
+        }
 
         queue!(
             self.terminal.stdout,
@@ -1133,6 +1331,27 @@ impl Editor {
                     Print("~"),
                     SetForegroundColor(CRT_FG)
                 )?;
+            }
+
+            if let Some((separator_x, preview_x, preview_width)) = preview_layout {
+                queue!(
+                    self.terminal.stdout,
+                    MoveTo(separator_x as u16, (screen_row + 1) as u16),
+                    SetForegroundColor(CRT_DIM_FG),
+                    Print(" | "),
+                    SetForegroundColor(CRT_FG),
+                    MoveTo(preview_x as u16, (screen_row + 1) as u16)
+                )?;
+                if let Some(preview_line) = self.preview_cache_lines.get(file_row).cloned() {
+                    self.draw_preview_line(&preview_line, preview_width)?;
+                } else {
+                    queue!(
+                        self.terminal.stdout,
+                        SetForegroundColor(CRT_DIM_FG),
+                        Print("~"),
+                        SetForegroundColor(CRT_FG)
+                    )?;
+                }
             }
         }
 
@@ -1250,8 +1469,16 @@ impl Editor {
         let cols = usize::from(cols);
         let name = self.doc.file_name_or_default();
         let modified = if self.doc.modified { " (modified)" } else { "" };
+        let preview = if self.preview_mode {
+            match self.preview_backend {
+                PreviewBackend::Glow => "Preview:Glow",
+                PreviewBackend::Fallback => "Preview:Fallback",
+            }
+        } else {
+            "Preview:OFF"
+        };
         let left = format!(
-            "{name} - {} lines, {} words{modified} [Markdown]",
+            "{name} - {} lines, {} words{modified} [Markdown] {preview}",
             self.doc.line_count(),
             self.doc.word_count()
         );
@@ -1588,4 +1815,75 @@ fn markdown_list_continuation(before_cursor: &str) -> Option<MarkdownContinuatio
     }
 
     None
+}
+
+fn find_glow_command() -> Option<PathBuf> {
+    if command_is_available("glow") {
+        return Some(PathBuf::from("glow"));
+    }
+    let candidate = env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .map(|home| home.join(".local/bin/glow"))?;
+    if command_is_available(&candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn command_is_available(command: impl AsRef<std::ffi::OsStr>) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn run_command_with_stdin(command: &mut Command, input: Option<&[u8]>) -> io::Result<Output> {
+    if let Some(bytes) = input {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(bytes)?;
+        }
+        child.wait_with_output()
+    } else {
+        command.output()
+    }
+}
+
+fn clip_to_char_width(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
+}
+
+fn html_heading_to_markdown(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("<h") {
+        return None;
+    }
+
+    let level_char = trimmed.chars().nth(2)?;
+    if !('1'..='6').contains(&level_char) {
+        return None;
+    }
+
+    let open_end = trimmed.find('>')?;
+    let close_tag = format!("</h{level_char}>");
+    if !trimmed.ends_with(&close_tag)
+        || open_end + 1 > trimmed.len().saturating_sub(close_tag.len())
+    {
+        return None;
+    }
+
+    let content = trimmed[open_end + 1..trimmed.len() - close_tag.len()].trim();
+    let level = level_char.to_digit(10)? as usize;
+    let hashes = "#".repeat(level);
+    Some(format!("{hashes} {content}"))
 }
