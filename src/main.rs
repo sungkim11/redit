@@ -7,20 +7,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::queue;
-use crossterm::style::{
-    Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
+use crossterm::style::ResetColor;
 use crossterm::terminal::{
-    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-    enable_raw_mode,
+    self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 fn main() -> io::Result<()> {
     let file_arg = env::args().nth(1).map(PathBuf::from);
@@ -323,8 +324,8 @@ const HELP_MENU_ENTRIES: &[MenuEntry] = &[
     },
 ];
 
-const PREVIEW_MIN_TOTAL_WIDTH: usize = 50;
-const PREVIEW_SEPARATOR_WIDTH: usize = 3;
+const PREVIEW_MIN_TOTAL_WIDTH: usize = 56;
+const PREVIEW_SEPARATOR_WIDTH: usize = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewBackend {
@@ -332,56 +333,23 @@ enum PreviewBackend {
     Fallback,
 }
 
-const CRT_BG: Color = Color::Rgb { r: 0, g: 12, b: 0 };
-const CRT_FG: Color = Color::Rgb {
-    r: 110,
-    g: 255,
-    b: 130,
-};
-const CRT_DIM_FG: Color = Color::Rgb {
-    r: 50,
-    g: 150,
-    b: 70,
-};
-const CRT_BAR_BG: Color = Color::Rgb {
-    r: 70,
-    g: 170,
-    b: 90,
-};
-const CRT_BAR_FG: Color = Color::Black;
-const CRT_ACTIVE_BG: Color = Color::Rgb {
-    r: 150,
-    g: 255,
-    b: 160,
-};
+const CRT_BG: Color = Color::Rgb(2, 12, 4);
+const CRT_FG: Color = Color::Rgb(255, 255, 255);
+const CRT_DIM_FG: Color = Color::Rgb(55, 148, 79);
+const CRT_BAR_BG: Color = Color::Rgb(16, 62, 30);
+const CRT_BAR_FG: Color = Color::Rgb(185, 255, 205);
+const CRT_ACTIVE_BG: Color = Color::Rgb(170, 255, 170);
 const CRT_ACTIVE_FG: Color = Color::Black;
-const CRT_MENU_BG: Color = Color::Rgb { r: 0, g: 40, b: 0 };
-const CRT_MENU_FG: Color = Color::Rgb {
-    r: 130,
-    g: 255,
-    b: 150,
-};
-const CRT_HEADING_FG: Color = Color::Rgb {
-    r: 180,
-    g: 255,
-    b: 185,
-};
-const CRT_LINK_TEXT_FG: Color = Color::Rgb {
-    r: 145,
-    g: 235,
-    b: 255,
-};
-const CRT_LINK_URL_FG: Color = Color::Rgb {
-    r: 110,
-    g: 200,
-    b: 245,
-};
-const CRT_HTML_TAG_FG: Color = Color::Blue;
-const CRT_CODE_FG: Color = Color::Rgb {
-    r: 140,
-    g: 240,
-    b: 130,
-};
+const CRT_MENU_BG: Color = Color::Rgb(7, 36, 18);
+const CRT_MENU_FG: Color = Color::Rgb(152, 245, 176);
+const CRT_HEADING_FG: Color = Color::Rgb(116, 170, 255);
+const CRT_HTML_TAG_FG: Color = Color::Rgb(132, 190, 255);
+const CRT_MARKER_FG: Color = Color::Rgb(92, 166, 255);
+const CRT_MARKER_BG: Color = Color::Rgb(7, 18, 44);
+const CRT_LINE_BG: Color = Color::Rgb(9, 24, 12);
+const CRT_PANEL_BORDER: Color = Color::Rgb(64, 164, 94);
+const CRT_PREVIEW_SEP: Color = Color::Rgb(47, 120, 68);
+const CRT_MESSAGE_BG: Color = Color::Rgb(11, 33, 17);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MdStyle {
@@ -390,6 +358,10 @@ enum MdStyle {
     Quote,
     Marker,
     Code,
+    Emphasis,
+    Strong,
+    EmphasisStrong,
+    Strike,
     LinkText,
     LinkUrl,
     HtmlTag,
@@ -752,18 +724,25 @@ impl Editor {
     }
 
     fn menu_at_column(&self, column: usize) -> Option<MenuKind> {
-        let mut x = 0;
-        for (index, (menu, label)) in MENU_ITEMS.iter().enumerate() {
-            if index > 0 {
-                x += 2;
-            }
-            let end = x + label.len();
+        for (menu, x, width) in Self::menu_item_bounds() {
+            let end = x + width;
             if (x..end).contains(&column) {
-                return Some(*menu);
+                return Some(menu);
             }
-            x = end;
         }
         None
+    }
+
+    fn menu_item_bounds() -> Vec<(MenuKind, usize, usize)> {
+        let mut x = " redit ".chars().count();
+        let mut bounds = Vec::with_capacity(MENU_ITEMS.len());
+        for (index, (menu, label)) in MENU_ITEMS.iter().enumerate() {
+            x += if index == 0 { 1 } else { 2 };
+            let width = format!(" {label} ").chars().count();
+            bounds.push((*menu, x, width));
+            x += width;
+        }
+        bounds
     }
 
     fn menu_entries(menu: MenuKind) -> &'static [MenuEntry] {
@@ -832,15 +811,10 @@ impl Editor {
     }
 
     fn menu_label_bounds(&self, menu: MenuKind) -> Option<(usize, usize)> {
-        let mut x = 0usize;
-        for (index, (kind, label)) in MENU_ITEMS.iter().enumerate() {
-            if index > 0 {
-                x += 2;
+        for (kind, x, width) in Self::menu_item_bounds() {
+            if kind == menu {
+                return Some((x, width));
             }
-            if *kind == menu {
-                return Some((x, label.len()));
-            }
-            x += label.len();
         }
         None
     }
@@ -861,10 +835,11 @@ impl Editor {
             .map(|entry| entry.label.len())
             .max()
             .unwrap_or(0);
-        let width = cmp::min(content_width + 2, cols - x);
+        let width = cmp::min(content_width + 4, cols - x);
         let max_height = rows.saturating_sub(3);
-        let height = cmp::min(entries.len(), max_height);
-        if width == 0 || height == 0 {
+        let entry_rows = cmp::min(entries.len(), max_height.saturating_sub(2));
+        let height = entry_rows + 2;
+        if width < 4 || entry_rows == 0 {
             return None;
         }
 
@@ -885,13 +860,13 @@ impl Editor {
         rows: usize,
     ) -> Option<usize> {
         let rect = self.dropdown_rect(menu, cols, rows)?;
-        if row < rect.y || row >= rect.y + rect.height {
+        if row <= rect.y || row >= rect.y + rect.height - 1 {
             return None;
         }
-        if column < rect.x || column >= rect.x + rect.width {
+        if column <= rect.x || column >= rect.x + rect.width - 1 {
             return None;
         }
-        Some(row - rect.y)
+        Some(row - rect.y - 1)
     }
 
     fn menu_item_index_by_mnemonic(&self, menu: MenuKind, mnemonic: char) -> Option<usize> {
@@ -955,7 +930,8 @@ impl Editor {
             self.preview_cache_width = 0;
             self.preview_cache_revision = 0;
             let (cols, _) = terminal::size().unwrap_or((80, 24));
-            if self.preview_layout(usize::from(cols)).is_some() {
+            let inner_cols = usize::from(cols).saturating_sub(2);
+            if self.preview_layout(inner_cols).is_some() {
                 self.status = StatusMessage::new("Preview enabled (Ctrl-P to hide).");
             } else {
                 self.status =
@@ -1082,21 +1058,6 @@ impl Editor {
             .collect()
     }
 
-    fn draw_preview_line(&mut self, line: &str, width: usize) -> io::Result<()> {
-        if self.preview_backend == PreviewBackend::Glow {
-            queue!(
-                self.terminal.stdout,
-                Print(line),
-                SetAttribute(Attribute::Reset),
-                SetBackgroundColor(CRT_BG),
-                SetForegroundColor(CRT_FG)
-            )
-        } else {
-            let clipped = clip_to_char_width(line, width);
-            queue!(self.terminal.stdout, Print(clipped))
-        }
-    }
-
     fn preview_source_lines(&self) -> Vec<String> {
         self.doc
             .lines
@@ -1215,7 +1176,7 @@ impl Editor {
 
     fn text_area_height(&self) -> usize {
         let (_, rows) = terminal::size().unwrap_or((80, 24));
-        usize::from(rows.saturating_sub(3))
+        usize::from(rows.saturating_sub(5))
     }
 
     fn gutter_width(&self) -> usize {
@@ -1225,8 +1186,8 @@ impl Editor {
 
     fn scroll(&mut self) {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
-        let cols = usize::from(cols);
-        let text_height = usize::from(rows.saturating_sub(3));
+        let cols = usize::from(cols).saturating_sub(2);
+        let text_height = usize::from(rows.saturating_sub(5));
         let text_width = self.editor_body_width(cols);
 
         if self.cursor.y < self.offset.y {
@@ -1254,39 +1215,48 @@ impl Editor {
         in_code_block
     }
 
-    fn draw_markdown_content(
-        &mut self,
+    fn markdown_spans_for_window(
         line: &str,
         offset_x: usize,
         width: usize,
         in_code_block: bool,
-    ) -> io::Result<bool> {
+        setext_heading: bool,
+        line_bg: Color,
+    ) -> (Vec<Span<'static>>, usize, bool) {
         let chars: Vec<char> = line.chars().collect();
-        let styles = markdown_styles_for_line(&chars, in_code_block);
+        let indented_code = !in_code_block && is_indented_code_line(line);
+        let styles = markdown_styles_for_line(&chars, in_code_block, setext_heading, indented_code);
         let line_len = chars.len();
         let start = cmp::min(offset_x, line_len);
         let end = cmp::min(start + width, line_len);
+        let mut spans = Vec::new();
+        let mut rendered = 0usize;
 
         if start < end {
             let mut current_style = styles[start];
-            apply_markdown_style(&mut self.terminal.stdout, current_style)?;
             let mut segment = String::new();
 
             for idx in start..end {
                 let style = styles[idx];
                 if style != current_style {
-                    queue!(self.terminal.stdout, Print(&segment))?;
-                    segment.clear();
+                    let text = std::mem::take(&mut segment);
+                    rendered += text.chars().count();
+                    spans.push(Span::styled(
+                        text,
+                        md_style_to_style(current_style, line_bg),
+                    ));
                     current_style = style;
-                    apply_markdown_style(&mut self.terminal.stdout, current_style)?;
                 }
                 segment.push(chars[idx]);
             }
 
             if !segment.is_empty() {
-                queue!(self.terminal.stdout, Print(segment))?;
+                rendered += segment.chars().count();
+                spans.push(Span::styled(
+                    segment,
+                    md_style_to_style(current_style, line_bg),
+                ));
             }
-            apply_markdown_style(&mut self.terminal.stdout, MdStyle::Normal)?;
         }
 
         let next_in_code_block = if is_fenced_code_line(line) {
@@ -1294,185 +1264,176 @@ impl Editor {
         } else {
             in_code_block
         };
-        Ok(next_in_code_block)
+        (spans, rendered, next_in_code_block)
     }
 
-    fn refresh_screen(&mut self) -> io::Result<()> {
-        let (cols, rows) = terminal::size()?;
-        let cols_usize = usize::from(cols);
-        let text_height = usize::from(rows.saturating_sub(3));
-        let gutter = self.gutter_width();
-        let body_width = self.editor_body_width(cols_usize);
-        let preview_layout = self.preview_layout(cols_usize);
-        if let Some((_, _, preview_width)) = preview_layout {
-            self.ensure_preview_cache(preview_width);
-        }
-
-        queue!(
-            self.terminal.stdout,
-            Hide,
-            SetBackgroundColor(CRT_BG),
-            SetForegroundColor(CRT_FG),
-            MoveTo(0, 0),
-            Clear(ClearType::All)
-        )?;
-
-        self.draw_top_menu(cols)?;
-
+    fn build_editor_lines(
+        &self,
+        text_height: usize,
+        gutter: usize,
+        body_width: usize,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(text_height);
         let mut in_code_block = self.code_block_state_before(self.offset.y);
+
         for screen_row in 0..text_height {
             let file_row = self.offset.y + screen_row;
-            queue!(self.terminal.stdout, MoveTo(0, (screen_row + 1) as u16))?;
-            let number = format!("{:>width$} ", file_row + 1, width = gutter - 1);
-            let line = self.doc.line(file_row).cloned();
-            if let Some(line) = line {
-                queue!(self.terminal.stdout, Print(number))?;
-                in_code_block =
-                    self.draw_markdown_content(&line, self.offset.x, body_width, in_code_block)?;
+            let line_bg = if file_row == self.cursor.y {
+                CRT_LINE_BG
             } else {
-                queue!(
-                    self.terminal.stdout,
-                    Print(number),
-                    SetForegroundColor(CRT_DIM_FG),
-                    Print("~"),
-                    SetForegroundColor(CRT_FG)
-                )?;
-            }
+                CRT_BG
+            };
+            let mut spans = vec![Span::styled(
+                format!(
+                    "{:>width$} ",
+                    file_row + 1,
+                    width = gutter.saturating_sub(1)
+                ),
+                Style::default().fg(CRT_DIM_FG).bg(line_bg),
+            )];
 
-            if let Some((separator_x, preview_x, preview_width)) = preview_layout {
-                queue!(
-                    self.terminal.stdout,
-                    MoveTo(separator_x as u16, (screen_row + 1) as u16),
-                    SetForegroundColor(CRT_DIM_FG),
-                    Print(" | "),
-                    SetForegroundColor(CRT_FG),
-                    MoveTo(preview_x as u16, (screen_row + 1) as u16)
-                )?;
-                if let Some(preview_line) = self.preview_cache_lines.get(file_row).cloned() {
-                    self.draw_preview_line(&preview_line, preview_width)?;
-                } else {
-                    queue!(
-                        self.terminal.stdout,
-                        SetForegroundColor(CRT_DIM_FG),
-                        Print("~"),
-                        SetForegroundColor(CRT_FG)
-                    )?;
+            if let Some(line) = self.doc.line(file_row) {
+                let next_line = self.doc.line(file_row + 1).map(String::as_str);
+                let setext_heading = !in_code_block
+                    && !line.trim().is_empty()
+                    && next_line.is_some_and(is_setext_underline_line);
+                let (mut content_spans, rendered, next_state) = Self::markdown_spans_for_window(
+                    line,
+                    self.offset.x,
+                    body_width,
+                    in_code_block,
+                    setext_heading,
+                    line_bg,
+                );
+                spans.append(&mut content_spans);
+                if rendered < body_width {
+                    spans.push(Span::styled(
+                        " ".repeat(body_width - rendered),
+                        Style::default().fg(CRT_FG).bg(line_bg),
+                    ));
+                }
+                in_code_block = next_state;
+            } else if body_width > 0 {
+                spans.push(Span::styled(
+                    "~",
+                    Style::default().fg(CRT_DIM_FG).bg(line_bg),
+                ));
+                if body_width > 1 {
+                    spans.push(Span::styled(
+                        " ".repeat(body_width - 1),
+                        Style::default().fg(CRT_FG).bg(line_bg),
+                    ));
                 }
             }
+
+            lines.push(Line::from(spans));
         }
 
-        self.draw_dropdown_menu(cols, rows)?;
-        self.draw_status_bar(cols)?;
-        self.draw_message_bar(cols, rows)?;
-
-        let cursor_screen_x = self.cursor.x.saturating_sub(self.offset.x) + gutter;
-        let cursor_screen_y = self.cursor.y.saturating_sub(self.offset.y) + 1;
-        if cursor_screen_y > 0 && cursor_screen_y <= text_height && cursor_screen_x < cols_usize {
-            queue!(
-                self.terminal.stdout,
-                MoveTo(cursor_screen_x as u16, cursor_screen_y as u16),
-                Show
-            )?;
-        } else {
-            queue!(self.terminal.stdout, Show)?;
-        }
-
-        self.terminal.stdout.flush()
+        lines
     }
 
-    fn draw_top_menu(&mut self, cols: u16) -> io::Result<()> {
-        let cols = usize::from(cols);
-        let active_menu = self.active_menu;
-        let mut x = 0usize;
+    fn build_preview_lines_for_view(
+        &self,
+        text_height: usize,
+        preview_width: usize,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(text_height);
+        for screen_row in 0..text_height {
+            let file_row = self.offset.y + screen_row;
+            if let Some(preview_line) = self.preview_cache_lines.get(file_row) {
+                let visible =
+                    clip_to_char_width(&strip_ansi_escape_codes(preview_line), preview_width);
+                let visible_width = visible.chars().count();
+                let mut spans = vec![Span::styled(
+                    visible,
+                    Style::default().fg(CRT_FG).bg(CRT_BG),
+                )];
+                if visible_width < preview_width {
+                    spans.push(Span::styled(
+                        " ".repeat(preview_width - visible_width),
+                        Style::default().fg(CRT_FG).bg(CRT_BG),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            } else if preview_width > 0 {
+                let mut spans = vec![Span::styled(
+                    "~",
+                    Style::default().fg(CRT_DIM_FG).bg(CRT_BG),
+                )];
+                if preview_width > 1 {
+                    spans.push(Span::styled(
+                        " ".repeat(preview_width - 1),
+                        Style::default().fg(CRT_FG).bg(CRT_BG),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            } else {
+                lines.push(Line::raw(String::new()));
+            }
+        }
+        lines
+    }
 
-        queue!(
-            self.terminal.stdout,
-            MoveTo(0, 0),
-            SetBackgroundColor(CRT_BAR_BG),
-            SetForegroundColor(CRT_BAR_FG),
-            Print(" ".repeat(cols)),
-            MoveTo(0, 0)
-        )?;
+    fn build_separator_lines(text_height: usize) -> Vec<Line<'static>> {
+        let separator = clip_to_char_width("│", PREVIEW_SEPARATOR_WIDTH);
+        (0..text_height)
+            .map(|_| {
+                Line::styled(
+                    pad_or_clip_to_char_width(&separator, PREVIEW_SEPARATOR_WIDTH),
+                    Style::default().fg(CRT_PREVIEW_SEP).bg(CRT_BG),
+                )
+            })
+            .collect()
+    }
+
+    fn build_top_menu_line(&self, cols: usize) -> Line<'static> {
+        let base = Style::default().fg(CRT_BAR_FG).bg(CRT_BAR_BG);
+        let active = Style::default().fg(CRT_ACTIVE_FG).bg(CRT_ACTIVE_BG);
+        let mut spans = Vec::new();
+        let mut used = 0usize;
+
+        let title = " redit ";
+        let title_width = title.chars().count();
+        if title_width <= cols {
+            spans.push(Span::styled(title, base));
+            used += title_width;
+        }
 
         for (index, (kind, label)) in MENU_ITEMS.iter().enumerate() {
-            if index > 0 {
-                queue!(self.terminal.stdout, Print("  "))?;
-                x += 2;
-            }
-            if x >= cols {
+            if used >= cols {
                 break;
             }
 
-            if active_menu == Some(*kind) {
-                queue!(
-                    self.terminal.stdout,
-                    SetBackgroundColor(CRT_ACTIVE_BG),
-                    SetForegroundColor(CRT_ACTIVE_FG),
-                    SetAttribute(Attribute::Bold)
-                )?;
+            let sep = if index == 0 { " " } else { "  " };
+            let sep_width = sep.chars().count();
+            if sep_width <= cols - used {
+                spans.push(Span::styled(sep, base));
+                used += sep_width;
             }
-            queue!(self.terminal.stdout, Print(*label))?;
-            if active_menu == Some(*kind) {
-                queue!(
-                    self.terminal.stdout,
-                    SetAttribute(Attribute::NormalIntensity),
-                    SetBackgroundColor(CRT_BAR_BG),
-                    SetForegroundColor(CRT_BAR_FG)
-                )?;
+
+            let item = format!(" {label} ");
+            let text = clip_to_char_width(&item, cols - used);
+            let text_width = text.chars().count();
+            if text_width == 0 {
+                break;
             }
-            x += label.len();
+            let style = if self.active_menu == Some(*kind) {
+                active
+            } else {
+                base
+            };
+            spans.push(Span::styled(text, style));
+            used += text_width;
         }
 
-        queue!(
-            self.terminal.stdout,
-            SetAttribute(Attribute::Reset),
-            SetBackgroundColor(CRT_BG),
-            SetForegroundColor(CRT_FG)
-        )
-    }
-
-    fn draw_dropdown_menu(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        let Some(menu) = self.active_menu else {
-            return Ok(());
-        };
-
-        let cols = usize::from(cols);
-        let rows = usize::from(rows);
-        let Some(rect) = self.dropdown_rect(menu, cols, rows) else {
-            return Ok(());
-        };
-
-        let entries = Self::menu_entries(menu);
-        for (idx, entry) in entries.iter().take(rect.height).enumerate() {
-            let mut line = format!(" {}", entry.label);
-            if line.len() < rect.width {
-                line.push_str(&" ".repeat(rect.width - line.len()));
-            }
-            line.truncate(rect.width);
-            let is_selected = idx == self.active_menu_index;
-            queue!(
-                self.terminal.stdout,
-                MoveTo(rect.x as u16, (rect.y + idx) as u16),
-                SetBackgroundColor(if is_selected {
-                    CRT_ACTIVE_BG
-                } else {
-                    CRT_MENU_BG
-                }),
-                SetForegroundColor(if is_selected {
-                    CRT_ACTIVE_FG
-                } else {
-                    CRT_MENU_FG
-                }),
-                Print(line),
-                SetBackgroundColor(CRT_BG),
-                SetForegroundColor(CRT_FG)
-            )?;
+        if used < cols {
+            spans.push(Span::styled(" ".repeat(cols - used), base));
         }
-        Ok(())
+
+        Line::from(spans)
     }
 
-    fn draw_status_bar(&mut self, cols: u16) -> io::Result<()> {
-        let cols = usize::from(cols);
+    fn status_bar_line(&self, cols: usize) -> String {
         let name = self.doc.file_name_or_default();
         let modified = if self.doc.modified { " (modified)" } else { "" };
         let preview = if self.preview_mode {
@@ -1484,74 +1445,231 @@ impl Editor {
             "Preview:OFF"
         };
         let left = format!(
-            "{name} - {} lines, {} words{modified} [Markdown] {preview}",
+            " {name} | {} lines | {} words{modified} | {preview}",
             self.doc.line_count(),
             self.doc.word_count()
         );
-        let right = format!("Ln {}, Col {}", self.cursor.y + 1, self.cursor.x + 1);
-
-        let mut line = left;
-        if line.len() + right.len() > cols {
-            line.truncate(cols.saturating_sub(right.len()));
+        let right = format!("Ln {}, Col {} ", self.cursor.y + 1, self.cursor.x + 1);
+        let right_width = right.chars().count();
+        if cols <= right_width {
+            return clip_to_char_width(&right, cols);
         }
-        while line.len() + right.len() < cols {
-            line.push(' ');
-        }
-        line.push_str(&right);
-        line.truncate(cols);
 
-        let row = terminal::size()?.1.saturating_sub(2);
-        queue!(
-            self.terminal.stdout,
-            MoveTo(0, row),
-            SetBackgroundColor(CRT_BAR_BG),
-            SetForegroundColor(CRT_BAR_FG),
-            Print(line),
-            SetAttribute(Attribute::Reset),
-            SetBackgroundColor(CRT_BG),
-            SetForegroundColor(CRT_FG)
-        )
+        let max_left = cols - right_width;
+        let mut result = clip_to_char_width(&left, max_left);
+        let left_width = result.chars().count();
+        if left_width < max_left {
+            result.push_str(&" ".repeat(max_left - left_width));
+        }
+        result.push_str(&right);
+        pad_or_clip_to_char_width(&result, cols)
     }
 
-    fn draw_message_bar(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        let cols = usize::from(cols);
-        let row = rows.saturating_sub(1);
-        queue!(
-            self.terminal.stdout,
-            MoveTo(0, row),
-            SetBackgroundColor(CRT_BG),
-            SetForegroundColor(CRT_FG),
-            Clear(ClearType::CurrentLine)
-        )?;
-
-        if self.status.created_at.elapsed() < Duration::from_secs(5) {
-            let mut msg = self.status.text.clone();
-            msg.truncate(cols);
-            queue!(self.terminal.stdout, Print(msg))?;
+    fn message_bar_line(&self, cols: usize) -> String {
+        if self.status.created_at.elapsed() >= Duration::from_secs(5) {
+            return " ".repeat(cols);
         }
+        let msg = clip_to_char_width(&self.status.text, cols);
+        pad_or_clip_to_char_width(&msg, cols)
+    }
+
+    fn dropdown_lines(&self, menu: MenuKind, rect: MenuRect) -> Vec<Line<'static>> {
+        let entries = Self::menu_entries(menu);
+        let inner_height = rect.height.saturating_sub(2);
+        let inner_width = rect.width.saturating_sub(2);
+        (0..inner_height)
+            .map(|idx| {
+                let is_selected = idx == self.active_menu_index;
+                let style = if is_selected {
+                    Style::default().fg(CRT_ACTIVE_FG).bg(CRT_ACTIVE_BG)
+                } else {
+                    Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)
+                };
+                let line = entries
+                    .get(idx)
+                    .map_or_else(|| String::new(), |entry| format!(" {} ", entry.label));
+                Line::styled(pad_or_clip_to_char_width(&line, inner_width), style)
+            })
+            .collect()
+    }
+
+    fn refresh_screen(&mut self) -> io::Result<()> {
+        let (cols, rows) = terminal::size()?;
+        let cols_usize = usize::from(cols);
+        let rows_usize = usize::from(rows);
+        let text_height = usize::from(rows.saturating_sub(5));
+        let inner_width = cols_usize.saturating_sub(2);
+        let gutter = self.gutter_width();
+        let body_width = self.editor_body_width(inner_width);
+        let preview_layout = self.preview_layout(inner_width);
+        if let Some((_, _, preview_width)) = preview_layout {
+            self.ensure_preview_cache(preview_width);
+        }
+
+        let menu_line = self.build_top_menu_line(cols_usize);
+        let editor_lines = self.build_editor_lines(text_height, gutter, body_width);
+        let separator_lines = preview_layout.map(|_| Self::build_separator_lines(text_height));
+        let preview_lines = preview_layout.map(|(_, _, preview_width)| {
+            self.build_preview_lines_for_view(text_height, preview_width)
+        });
+        let status_line = self.status_bar_line(cols_usize);
+        let message_line = self.message_bar_line(cols_usize);
+        let dropdown = self.active_menu.and_then(|menu| {
+            self.dropdown_rect(menu, cols_usize, rows_usize)
+                .map(|rect| (rect, self.dropdown_lines(menu, rect)))
+        });
+        let cursor_rel_x = self.cursor.x.saturating_sub(self.offset.x) + gutter;
+        let cursor_rel_y = self.cursor.y.saturating_sub(self.offset.y);
+        let cursor_screen_x = cursor_rel_x + 1;
+        let cursor_screen_y = cursor_rel_y + 2;
+        let show_cursor = cursor_rel_y < text_height && cursor_rel_x < inner_width;
+        let message_active = self.status.created_at.elapsed() < Duration::from_secs(5);
+
+        self.terminal.terminal.draw(|frame| {
+            let full_area = frame.area();
+            let menu_area = Rect::new(0, 0, full_area.width, 1);
+            let body_outer_height = full_area.height.saturating_sub(3);
+            let body_outer_area = Rect::new(0, 1, full_area.width, body_outer_height);
+            let status_area = Rect::new(0, full_area.height.saturating_sub(2), full_area.width, 1);
+            let message_area = Rect::new(0, full_area.height.saturating_sub(1), full_area.width, 1);
+
+            frame.render_widget(Clear, full_area);
+            frame.render_widget(
+                Paragraph::new(vec![menu_line.clone()])
+                    .style(Style::default().fg(CRT_BAR_FG).bg(CRT_BAR_BG)),
+                menu_area,
+            );
+
+            let mut panel_title = self.doc.file_name_or_default();
+            if self.doc.modified {
+                panel_title.push_str(" *");
+            }
+            if preview_layout.is_some() {
+                panel_title.push_str(" | Split Preview");
+            }
+            let body_block = Block::default()
+                .title(format!(" {panel_title} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_BG));
+            frame.render_widget(body_block.clone(), body_outer_area);
+            let body_area = body_block.inner(body_outer_area);
+
+            if body_area.height > 0 && body_area.width > 0 {
+                if let Some((separator_x, preview_x, _)) = preview_layout {
+                    let editor_area = Rect::new(
+                        body_area.x,
+                        body_area.y,
+                        separator_x as u16,
+                        body_area.height,
+                    );
+                    let separator_area = Rect::new(
+                        body_area.x + separator_x as u16,
+                        body_area.y,
+                        PREVIEW_SEPARATOR_WIDTH as u16,
+                        body_area.height,
+                    );
+                    let preview_area = Rect::new(
+                        body_area.x + preview_x as u16,
+                        body_area.y,
+                        body_area.width.saturating_sub(preview_x as u16),
+                        body_area.height,
+                    );
+
+                    frame.render_widget(
+                        Paragraph::new(editor_lines.clone())
+                            .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
+                        editor_area,
+                    );
+                    if let Some(lines) = &separator_lines {
+                        frame.render_widget(
+                            Paragraph::new(lines.clone())
+                                .style(Style::default().fg(CRT_PREVIEW_SEP).bg(CRT_BG)),
+                            separator_area,
+                        );
+                    }
+                    if let Some(lines) = &preview_lines {
+                        frame.render_widget(
+                            Paragraph::new(lines.clone())
+                                .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
+                            preview_area,
+                        );
+                    }
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(editor_lines.clone())
+                            .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
+                        body_area,
+                    );
+                }
+            }
+
+            frame.render_widget(
+                Paragraph::new(status_line.clone())
+                    .style(Style::default().fg(CRT_BAR_FG).bg(CRT_BAR_BG)),
+                status_area,
+            );
+            let message_style = if message_active {
+                Style::default().fg(CRT_HEADING_FG).bg(CRT_MESSAGE_BG)
+            } else {
+                Style::default().fg(CRT_DIM_FG).bg(CRT_BG)
+            };
+            frame.render_widget(
+                Paragraph::new(message_line.clone()).style(message_style),
+                message_area,
+            );
+
+            if let Some((rect, lines)) = &dropdown {
+                let popup = Rect::new(
+                    rect.x as u16,
+                    rect.y as u16,
+                    rect.width as u16,
+                    rect.height as u16,
+                );
+                frame.render_widget(Clear, popup);
+                let menu_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                frame.render_widget(menu_block.clone(), popup);
+                let inner = menu_block.inner(popup);
+                frame.render_widget(Paragraph::new(lines.clone()), inner);
+            }
+
+            if show_cursor {
+                frame.set_cursor_position((cursor_screen_x as u16, cursor_screen_y as u16));
+            }
+        })?;
+
+        if show_cursor {
+            self.terminal.terminal.show_cursor()?;
+        } else {
+            self.terminal.terminal.hide_cursor()?;
+        }
+
         Ok(())
     }
 }
 
 struct TerminalGuard {
-    stdout: Stdout,
+    terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
 impl TerminalGuard {
     fn new() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
-        Ok(Self { stdout })
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self { terminal })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        let _ = self.terminal.show_cursor();
         let _ = execute!(
-            self.stdout,
+            self.terminal.backend_mut(),
             ResetColor,
-            Show,
             DisableMouseCapture,
             LeaveAlternateScreen
         );
@@ -1576,29 +1694,47 @@ fn remove_char_at(line: &mut String, char_idx: usize) -> Option<char> {
     removed
 }
 
-fn apply_markdown_style(stdout: &mut Stdout, style: MdStyle) -> io::Result<()> {
-    let (fg, bold) = match style {
-        MdStyle::Normal => (CRT_FG, false),
-        MdStyle::Heading => (CRT_HEADING_FG, true),
-        MdStyle::Quote => (CRT_DIM_FG, false),
-        MdStyle::Marker => (CRT_ACTIVE_BG, true),
-        MdStyle::Code => (CRT_CODE_FG, false),
-        MdStyle::LinkText => (CRT_LINK_TEXT_FG, false),
-        MdStyle::LinkUrl => (CRT_LINK_URL_FG, false),
-        MdStyle::HtmlTag => (CRT_HTML_TAG_FG, false),
-    };
-    queue!(
-        stdout,
-        SetForegroundColor(fg),
-        SetAttribute(if bold {
-            Attribute::Bold
-        } else {
-            Attribute::NormalIntensity
-        })
-    )
+fn md_style_to_style(style: MdStyle, bg: Color) -> Style {
+    match style {
+        MdStyle::Normal => Style::default().fg(CRT_FG).bg(bg),
+        MdStyle::Heading => Style::default().fg(CRT_FG).bg(bg),
+        MdStyle::Quote => Style::default()
+            .fg(CRT_FG)
+            .bg(bg)
+            .add_modifier(Modifier::ITALIC),
+        MdStyle::Marker => Style::default().fg(CRT_MARKER_FG).bg(CRT_MARKER_BG),
+        MdStyle::Code => Style::default()
+            .fg(CRT_FG)
+            .bg(bg)
+            .add_modifier(Modifier::DIM),
+        MdStyle::Emphasis => Style::default()
+            .fg(CRT_FG)
+            .bg(bg)
+            .add_modifier(Modifier::ITALIC),
+        MdStyle::Strong => Style::default().fg(CRT_FG).bg(bg),
+        MdStyle::EmphasisStrong => Style::default()
+            .fg(CRT_FG)
+            .bg(bg)
+            .add_modifier(Modifier::ITALIC),
+        MdStyle::Strike => Style::default()
+            .fg(CRT_FG)
+            .bg(bg)
+            .add_modifier(Modifier::DIM),
+        MdStyle::LinkText => Style::default().fg(CRT_FG).bg(bg),
+        MdStyle::LinkUrl => Style::default()
+            .fg(CRT_FG)
+            .bg(bg)
+            .add_modifier(Modifier::ITALIC),
+        MdStyle::HtmlTag => Style::default().fg(CRT_HTML_TAG_FG).bg(bg),
+    }
 }
 
-fn markdown_styles_for_line(chars: &[char], in_code_block: bool) -> Vec<MdStyle> {
+fn markdown_styles_for_line(
+    chars: &[char],
+    in_code_block: bool,
+    setext_heading: bool,
+    indented_code: bool,
+) -> Vec<MdStyle> {
     let len = chars.len();
     let mut styles = vec![MdStyle::Normal; len];
     if len == 0 {
@@ -1612,6 +1748,20 @@ fn markdown_styles_for_line(chars: &[char], in_code_block: bool) -> Vec<MdStyle>
 
     if in_code_block {
         styles.fill(MdStyle::Code);
+        return styles;
+    }
+
+    if indented_code {
+        styles.fill(MdStyle::Code);
+        return styles;
+    }
+
+    if setext_heading {
+        styles.fill(MdStyle::Heading);
+    }
+
+    if is_setext_underline_chars(chars) || is_thematic_break_chars(chars) {
+        styles.fill(MdStyle::Marker);
         return styles;
     }
 
@@ -1635,7 +1785,12 @@ fn markdown_styles_for_line(chars: &[char], in_code_block: bool) -> Vec<MdStyle>
 
     apply_link_styles(chars, &mut styles);
     apply_html_tag_styles(chars, &mut styles);
+    apply_autolink_styles(chars, &mut styles);
     apply_inline_code_styles(chars, &mut styles);
+    apply_emphasis_strong_styles(chars, &mut styles);
+    apply_strikethrough_styles(chars, &mut styles);
+    apply_strong_styles(chars, &mut styles);
+    apply_emphasis_styles(chars, &mut styles);
     styles
 }
 
@@ -1675,14 +1830,75 @@ fn markdown_list_marker(chars: &[char], start: usize) -> Option<(usize, usize)> 
     None
 }
 
+fn is_setext_underline_line(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    is_setext_underline_chars(&chars)
+}
+
+fn is_setext_underline_chars(chars: &[char]) -> bool {
+    let start = chars
+        .iter()
+        .position(|c| !c.is_whitespace())
+        .unwrap_or(chars.len());
+    if start >= chars.len() {
+        return false;
+    }
+
+    let marker = chars[start];
+    if marker != '=' && marker != '-' {
+        return false;
+    }
+
+    let mut marker_count = 0usize;
+    for c in chars.iter().skip(start) {
+        if *c == marker {
+            marker_count += 1;
+        } else if c.is_whitespace() {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    marker_count >= 1
+}
+
+fn is_thematic_break_chars(chars: &[char]) -> bool {
+    let start = chars
+        .iter()
+        .position(|c| !c.is_whitespace())
+        .unwrap_or(chars.len());
+    if start >= chars.len() {
+        return false;
+    }
+
+    let marker = chars[start];
+    if !matches!(marker, '-' | '*' | '_') {
+        return false;
+    }
+
+    let mut marker_count = 0usize;
+    for c in chars.iter().skip(start) {
+        if *c == marker {
+            marker_count += 1;
+        } else if c.is_whitespace() {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    marker_count >= 3
+}
+
 fn apply_link_styles(chars: &[char], styles: &mut [MdStyle]) {
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] != '[' {
+        if chars[i] != '[' || is_escaped_marker(chars, i) {
             i += 1;
             continue;
         }
-        let Some(close_bracket) = (i + 1..chars.len()).find(|&j| chars[j] == ']') else {
+        let Some(close_bracket) =
+            (i + 1..chars.len()).find(|&j| chars[j] == ']' && !is_escaped_marker(chars, j))
+        else {
             i += 1;
             continue;
         };
@@ -1690,12 +1906,17 @@ fn apply_link_styles(chars: &[char], styles: &mut [MdStyle]) {
             i += 1;
             continue;
         }
-        let Some(close_paren) = (close_bracket + 2..chars.len()).find(|&j| chars[j] == ')') else {
+        let Some(close_paren) = (close_bracket + 2..chars.len())
+            .find(|&j| chars[j] == ')' && !is_escaped_marker(chars, j))
+        else {
             i += 1;
             continue;
         };
 
         styles[i] = MdStyle::Marker;
+        if i > 0 && chars[i - 1] == '!' && !is_escaped_marker(chars, i - 1) {
+            styles[i - 1] = MdStyle::Marker;
+        }
         styles[close_bracket] = MdStyle::Marker;
         styles[close_bracket + 1] = MdStyle::Marker;
         styles[close_paren] = MdStyle::Marker;
@@ -1708,7 +1929,7 @@ fn apply_link_styles(chars: &[char], styles: &mut [MdStyle]) {
 fn apply_html_tag_styles(chars: &[char], styles: &mut [MdStyle]) {
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] != '<' {
+        if chars[i] != '<' || is_escaped_marker(chars, i) {
             i += 1;
             continue;
         }
@@ -1740,14 +1961,67 @@ fn looks_like_html_tag_head(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '!' || c == '?'
 }
 
-fn apply_inline_code_styles(chars: &[char], styles: &mut [MdStyle]) {
+fn apply_autolink_styles(chars: &[char], styles: &mut [MdStyle]) {
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] != '`' {
+        if chars[i] != '<' || is_escaped_marker(chars, i) {
             i += 1;
             continue;
         }
-        let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '`') else {
+
+        let Some(end) =
+            (i + 1..chars.len()).find(|&j| chars[j] == '>' && !is_escaped_marker(chars, j))
+        else {
+            i += 1;
+            continue;
+        };
+
+        if end <= i + 1 {
+            i += 1;
+            continue;
+        }
+
+        if !is_autolink_target(&chars[i + 1..end]) {
+            i += 1;
+            continue;
+        }
+
+        styles[i] = MdStyle::Marker;
+        styles[end] = MdStyle::Marker;
+        paint_style_range(styles, i + 1, end, MdStyle::LinkUrl);
+        i = end + 1;
+    }
+}
+
+fn is_autolink_target(content: &[char]) -> bool {
+    if content.is_empty() || content.iter().any(|c| c.is_whitespace()) {
+        return false;
+    }
+
+    let text: String = content.iter().collect();
+    if text.starts_with("http://") || text.starts_with("https://") || text.starts_with("mailto:") {
+        return true;
+    }
+
+    let mut parts = text.split('@');
+    let local = parts.next().unwrap_or_default();
+    let domain = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return false;
+    }
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+fn apply_inline_code_styles(chars: &[char], styles: &mut [MdStyle]) {
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '`' || is_escaped_marker(chars, i) {
+            i += 1;
+            continue;
+        }
+        let Some(end) =
+            (i + 1..chars.len()).find(|&j| chars[j] == '`' && !is_escaped_marker(chars, j))
+        else {
             styles[i] = MdStyle::Marker;
             i += 1;
             continue;
@@ -1757,6 +2031,271 @@ fn apply_inline_code_styles(chars: &[char], styles: &mut [MdStyle]) {
         paint_style_range(styles, i + 1, end, MdStyle::Code);
         i = end + 1;
     }
+}
+
+fn apply_emphasis_strong_styles(chars: &[char], styles: &mut [MdStyle]) {
+    apply_triple_delimited_style(chars, styles, '*');
+    apply_triple_delimited_style(chars, styles, '_');
+}
+
+fn apply_strikethrough_styles(chars: &[char], styles: &mut [MdStyle]) {
+    apply_double_delimited_style(chars, styles, '~', MdStyle::Strike);
+}
+
+fn apply_strong_styles(chars: &[char], styles: &mut [MdStyle]) {
+    apply_double_delimited_style(chars, styles, '*', MdStyle::Strong);
+    apply_double_delimited_style(chars, styles, '_', MdStyle::Strong);
+}
+
+fn apply_emphasis_styles(chars: &[char], styles: &mut [MdStyle]) {
+    apply_single_delimited_style(chars, styles, '*', MdStyle::Emphasis);
+    apply_single_delimited_style(chars, styles, '_', MdStyle::Emphasis);
+}
+
+fn apply_triple_delimited_style(chars: &[char], styles: &mut [MdStyle], marker: char) {
+    let len = chars.len();
+    let mut i = 0;
+    while i + 2 < len {
+        if chars[i] != marker
+            || chars[i + 1] != marker
+            || chars[i + 2] != marker
+            || is_escaped_marker(chars, i)
+            || !can_restyle_span(styles, i, i + 3)
+        {
+            i += 1;
+            continue;
+        }
+
+        if marker == '_'
+            && i > 0
+            && i + 3 < len
+            && chars[i - 1].is_ascii_alphanumeric()
+            && chars[i + 3].is_ascii_alphanumeric()
+        {
+            i += 1;
+            continue;
+        }
+
+        let content_start = i + 3;
+        if content_start >= len || chars[content_start].is_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        let mut j = content_start;
+        let mut found = None;
+        while j + 2 < len {
+            if chars[j] == marker
+                && chars[j + 1] == marker
+                && chars[j + 2] == marker
+                && !is_escaped_marker(chars, j)
+                && can_restyle_span(styles, j, j + 3)
+                && j > content_start
+                && !chars[j - 1].is_whitespace()
+                && can_restyle_span(styles, content_start, j)
+                && chars[content_start..j].iter().any(|c| !c.is_whitespace())
+            {
+                if marker == '_'
+                    && j > 0
+                    && j + 3 < len
+                    && chars[j - 1].is_ascii_alphanumeric()
+                    && chars[j + 3].is_ascii_alphanumeric()
+                {
+                    j += 1;
+                    continue;
+                }
+                found = Some(j);
+                break;
+            }
+            j += 1;
+        }
+
+        if let Some(end) = found {
+            styles[i] = MdStyle::Marker;
+            styles[i + 1] = MdStyle::Marker;
+            styles[i + 2] = MdStyle::Marker;
+            styles[end] = MdStyle::Marker;
+            styles[end + 1] = MdStyle::Marker;
+            styles[end + 2] = MdStyle::Marker;
+            paint_style_range(styles, content_start, end, MdStyle::EmphasisStrong);
+            i = end + 3;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn apply_double_delimited_style(
+    chars: &[char],
+    styles: &mut [MdStyle],
+    marker: char,
+    fill_style: MdStyle,
+) {
+    let len = chars.len();
+    let mut i = 0;
+    while i + 1 < len {
+        if chars[i] != marker
+            || chars[i + 1] != marker
+            || is_escaped_marker(chars, i)
+            || !can_restyle_span(styles, i, i + 2)
+        {
+            i += 1;
+            continue;
+        }
+        if marker == '_'
+            && i > 0
+            && i + 2 < len
+            && chars[i - 1].is_ascii_alphanumeric()
+            && chars[i + 2].is_ascii_alphanumeric()
+        {
+            i += 1;
+            continue;
+        }
+
+        let content_start = i + 2;
+        if content_start >= len || chars[content_start].is_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        let mut j = content_start;
+        let mut found = None;
+        while j + 1 < len {
+            if chars[j] == marker
+                && chars[j + 1] == marker
+                && !is_escaped_marker(chars, j)
+                && can_restyle_span(styles, j, j + 2)
+                && j > content_start
+                && !chars[j - 1].is_whitespace()
+                && can_restyle_span(styles, content_start, j)
+                && chars[content_start..j].iter().any(|c| !c.is_whitespace())
+            {
+                if marker == '_'
+                    && j > 0
+                    && j + 2 < len
+                    && chars[j - 1].is_ascii_alphanumeric()
+                    && chars[j + 2].is_ascii_alphanumeric()
+                {
+                    j += 1;
+                    continue;
+                }
+                found = Some(j);
+                break;
+            }
+            j += 1;
+        }
+
+        if let Some(end) = found {
+            styles[i] = MdStyle::Marker;
+            styles[i + 1] = MdStyle::Marker;
+            styles[end] = MdStyle::Marker;
+            styles[end + 1] = MdStyle::Marker;
+            paint_style_range(styles, content_start, end, fill_style);
+            i = end + 2;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn apply_single_delimited_style(
+    chars: &[char],
+    styles: &mut [MdStyle],
+    marker: char,
+    fill_style: MdStyle,
+) {
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if chars[i] != marker || is_escaped_marker(chars, i) || !can_restyle_span(styles, i, i + 1)
+        {
+            i += 1;
+            continue;
+        }
+        if (i > 0 && chars[i - 1] == marker) || (i + 1 < len && chars[i + 1] == marker) {
+            i += 1;
+            continue;
+        }
+        if marker == '_'
+            && i > 0
+            && i + 1 < len
+            && chars[i - 1].is_ascii_alphanumeric()
+            && chars[i + 1].is_ascii_alphanumeric()
+        {
+            i += 1;
+            continue;
+        }
+
+        let content_start = i + 1;
+        if content_start >= len || chars[content_start].is_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        let mut j = content_start;
+        let mut found = None;
+        while j < len {
+            if chars[j] == marker
+                && !is_escaped_marker(chars, j)
+                && can_restyle_span(styles, j, j + 1)
+                && j > content_start
+                && !chars[j - 1].is_whitespace()
+                && can_restyle_span(styles, content_start, j)
+                && chars[content_start..j].iter().any(|c| !c.is_whitespace())
+                && (j == 0 || chars[j - 1] != marker)
+                && (j + 1 >= len || chars[j + 1] != marker)
+            {
+                if marker == '_'
+                    && j > 0
+                    && j + 1 < len
+                    && chars[j - 1].is_ascii_alphanumeric()
+                    && chars[j + 1].is_ascii_alphanumeric()
+                {
+                    j += 1;
+                    continue;
+                }
+                found = Some(j);
+                break;
+            }
+            j += 1;
+        }
+
+        if let Some(end) = found {
+            styles[i] = MdStyle::Marker;
+            styles[end] = MdStyle::Marker;
+            paint_style_range(styles, content_start, end, fill_style);
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn can_restyle_span(styles: &[MdStyle], start: usize, end: usize) -> bool {
+    if start >= end || end > styles.len() {
+        return false;
+    }
+    styles[start..end]
+        .iter()
+        .all(|style| matches!(style, MdStyle::Normal | MdStyle::Heading | MdStyle::Quote))
+}
+
+fn is_escaped_marker(chars: &[char], idx: usize) -> bool {
+    if idx == 0 {
+        return false;
+    }
+
+    let mut backslashes = 0usize;
+    let mut pos = idx;
+    while pos > 0 {
+        pos -= 1;
+        if chars[pos] == '\\' {
+            backslashes += 1;
+        } else {
+            break;
+        }
+    }
+    backslashes % 2 == 1
 }
 
 fn is_fenced_code_line(line: &str) -> bool {
@@ -1774,6 +2313,10 @@ fn is_fenced_code_chars(chars: &[char]) -> bool {
     }
     (chars[start] == '`' && chars[start + 1] == '`' && chars[start + 2] == '`')
         || (chars[start] == '~' && chars[start + 1] == '~' && chars[start + 2] == '~')
+}
+
+fn is_indented_code_line(line: &str) -> bool {
+    line.starts_with("    ") || line.starts_with('\t')
 }
 
 fn markdown_list_continuation(before_cursor: &str) -> Option<MarkdownContinuation> {
@@ -1867,6 +2410,36 @@ fn run_command_with_stdin(command: &mut Command, input: Option<&[u8]>) -> io::Re
 
 fn clip_to_char_width(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+fn pad_or_clip_to_char_width(text: &str, width: usize) -> String {
+    let clipped = clip_to_char_width(text, width);
+    let used = clipped.chars().count();
+    if used < width {
+        format!("{clipped}{}", " ".repeat(width - used))
+    } else {
+        clipped
+    }
+}
+
+fn strip_ansi_escape_codes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek().copied() == Some('[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn html_heading_to_markdown(line: &str) -> Option<String> {

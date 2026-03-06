@@ -14,11 +14,11 @@ cargo run -- path/to/file.md   # run with a file
 cargo run                      # run with empty buffer
 ```
 
-No tests or linter are configured. Rust edition 2024, single dependency: `crossterm 0.29`.
+No tests or linter are configured. Rust edition 2024. Core UI deps: `crossterm 0.29` and `ratatui 0.30`.
 
 ## Architecture
 
-This is a single-file terminal markdown editor (`src/main.rs`, ~1900 lines) using crossterm for terminal I/O. The entire application lives in one file with no modules.
+This is a single-file terminal markdown editor (`src/main.rs`, ~1900 lines). It uses crossterm for terminal mode/event I/O and Ratatui for frame rendering. The entire application lives in one file with no modules.
 
 ### Core Types
 
@@ -28,9 +28,9 @@ This is a single-file terminal markdown editor (`src/main.rs`, ~1900 lines) usin
 
 ### Rendering Pipeline
 
-`refresh_screen()` queues crossterm commands (no immediate flush): clears screen, draws top menu bar, iterates visible lines drawing gutter + markdown-highlighted content + optional preview pane, then draws dropdown menus, status bar, and message line. Final `flush()` at end.
+`refresh_screen()` builds editor/menu/status/message view models, then draws a full Ratatui frame: top menu bar, visible text area (with optional split preview), dropdown menu overlay, status bar, and message line.
 
-Markdown syntax highlighting is character-level: `markdown_styles_for_line()` produces a `Vec<MdStyle>` per line, then segments of identical style are batched and printed with `apply_markdown_style()`.
+Markdown syntax highlighting is character-level: `markdown_styles_for_line()` produces a `Vec<MdStyle>` per line, then segments of identical style are converted into Ratatui `Span`s via `md_style_to_style()`.
 
 ### Preview System
 
@@ -49,6 +49,7 @@ All colors are `const` values prefixed with `CRT_` — retro green-on-black term
 ### Key Helper Functions (standalone)
 
 - `markdown_styles_for_line()` / `apply_link_styles()` / `apply_inline_code_styles()` / `apply_html_tag_styles()` — character-level style computation
+- `md_style_to_style()` — maps markdown style tokens to Ratatui `Style`
 - `markdown_list_continuation()` — auto-continue lists on Enter
 - `html_heading_to_markdown()` — converts `<h1>`–`<h6>` HTML tags to `#` headings for preview normalization
 - `clip_to_char_width()` — truncate string to N characters
