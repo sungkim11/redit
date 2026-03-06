@@ -1890,6 +1890,11 @@ fn html_heading_to_markdown(line: &str) -> Option<String> {
 
     let content = trimmed[open_end + 1..trimmed.len() - close_tag.len()].trim();
     let level = level_char.to_digit(10)? as usize;
-    let hashes = "#".repeat(level);
-    Some(format!("{hashes} {content}"))
+    if level == 1 {
+        Some(format!("# {content}"))
+    } else {
+        // Use bold for h2+ because Glow's dark theme renders ATX h2+ with
+        // a visible "##" prefix, which looks like raw markdown syntax.
+        Some(format!("**{content}**"))
+    }
 }
