@@ -18,11 +18,13 @@ If no file is provided, it starts with an empty buffer.
 - Syntax highlighting for headings, lists, blockquotes, fenced/inline code, links, and inline HTML tags
 - Auto-continue Markdown lists when pressing `Enter` (unordered and ordered)
 - Status bar shows Markdown document stats (lines + words)
+- Split preview mode (`Ctrl-P`) with Glow backend when available
 
 ## Keybindings
 
 - `Ctrl-S`: save (defaults to `redit.md` when no file path is set)
 - `Ctrl-Q`: quit (`Ctrl-Q` twice if there are unsaved changes)
+- `Ctrl-P`: toggle split preview pane
 - `Alt-F`, `Alt-E`, `Alt-S`, `Alt-H`: open top menus (`File/Edit/Search/Help`)
 - Menu mode: `Left/Right` switch menus, `Up/Down` move item, `Enter` activate, `Esc` close
 - Edit/Search/Help shortcuts: `Ctrl-Z`, `Ctrl-Y`, `Ctrl-X`, `Ctrl-C`, `Ctrl-V`, `Ctrl-F`, `Ctrl-R`, `F1`
@@ -38,3 +40,4 @@ If no file is provided, it starts with an empty buffer.
 ## Notes
 
 - Requires a standard Rust-supported linker toolchain on Linux (`build-essential` on Debian/Ubuntu).
+- Glow preview requires `glow` in PATH (falls back to plain preview when unavailable).
