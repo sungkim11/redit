@@ -10,9 +10,11 @@ It provides a multi-pane TUI with a file explorer, markdown-aware editor, option
   - Tree view for directories/files
   - Expand/collapse directories
   - Double-click support for open/toggle
+  - Reliable mouse selection across the full explorer pane while terminal pane is visible
 - Editor pane (center/right):
   - Line numbers
-  - Markdown syntax highlighting (headings, markers, emphasis markers, links, code, HTML tags)
+  - Markdown syntax highlighting (`.md`, `.markdown`, etc.)
+  - Code/config syntax highlighting in edit pane for many file types via Syntect (for example Python, JavaScript, TypeScript, Go, Rust, TOML, YAML, `.env`)
   - Markdown list auto-continuation on `Enter`
   - Mouse text selection (drag)
 - Markdown preview:

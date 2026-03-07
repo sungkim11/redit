@@ -1,5 +1,7 @@
 use std::cmp;
 use std::io;
+use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::terminal;
@@ -7,12 +9,20 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{
+    FontStyle, Style as SyntectStyle, Theme as SyntectTheme, ThemeSet as SyntectThemeSet,
+};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::markdown::{
     MdStyle, is_fenced_code_line, is_indented_code_line, is_setext_underline_line,
     markdown_styles_for_line,
 };
 use crate::*;
+
+static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static SYNTAX_THEMES: LazyLock<SyntectThemeSet> = LazyLock::new(SyntectThemeSet::load_defaults);
 
 impl Editor {
     fn code_block_state_before(&self, row: usize) -> bool {
@@ -85,6 +95,23 @@ impl Editor {
         gutter: usize,
         body_width: usize,
     ) -> Vec<Line<'static>> {
+        if self.use_markdown_highlighting() {
+            return self.build_markdown_editor_lines(text_height, gutter, body_width);
+        }
+
+        if let Some(syntax) = self.code_syntax() {
+            return self.build_code_editor_lines(text_height, gutter, body_width, syntax);
+        }
+
+        self.build_plain_editor_lines(text_height, gutter, body_width)
+    }
+
+    fn build_markdown_editor_lines(
+        &self,
+        text_height: usize,
+        gutter: usize,
+        body_width: usize,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::with_capacity(text_height);
         let mut in_code_block = self.code_block_state_before(self.offset.y);
         let theme = &self.theme;
@@ -139,6 +166,276 @@ impl Editor {
         }
 
         lines
+    }
+
+    fn build_code_editor_lines(
+        &self,
+        text_height: usize,
+        gutter: usize,
+        body_width: usize,
+        syntax: &'static SyntaxReference,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(text_height);
+        let mut highlighter = HighlightLines::new(syntax, self.syntect_theme());
+        let theme = &self.theme;
+
+        for line in self.doc.lines.iter().take(self.offset.y) {
+            if highlighter.highlight_line(line, &SYNTAX_SET).is_err() {
+                break;
+            }
+        }
+
+        for screen_row in 0..text_height {
+            let file_row = self.offset.y + screen_row;
+            let line_bg = if file_row == self.cursor.y {
+                theme.line_bg
+            } else {
+                theme.bg
+            };
+            let mut spans = vec![Span::styled(
+                format!(
+                    "{:>width$} ",
+                    file_row + 1,
+                    width = gutter.saturating_sub(1)
+                ),
+                Style::default().fg(theme.dim_fg).bg(line_bg),
+            )];
+
+            if let Some(line) = self.doc.line(file_row) {
+                let selected = self.selection_range_for_line(file_row, line.chars().count());
+                let (mut content_spans, rendered) =
+                    match highlighter.highlight_line(line, &SYNTAX_SET) {
+                        Ok(highlighted) => Self::syntect_spans_for_window(
+                            &highlighted,
+                            self.offset.x,
+                            body_width,
+                            line_bg,
+                            selected,
+                            theme,
+                        ),
+                        Err(_) => Self::plain_spans_for_window(
+                            line,
+                            self.offset.x,
+                            body_width,
+                            line_bg,
+                            selected,
+                            theme,
+                        ),
+                    };
+                spans.append(&mut content_spans);
+                if rendered < body_width {
+                    spans.push(Span::styled(
+                        " ".repeat(body_width - rendered),
+                        Style::default().fg(theme.fg).bg(line_bg),
+                    ));
+                }
+            } else if body_width > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(body_width),
+                    Style::default().fg(theme.fg).bg(line_bg),
+                ));
+            }
+
+            lines.push(Line::from(spans));
+        }
+
+        lines
+    }
+
+    fn build_plain_editor_lines(
+        &self,
+        text_height: usize,
+        gutter: usize,
+        body_width: usize,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::with_capacity(text_height);
+        let theme = &self.theme;
+
+        for screen_row in 0..text_height {
+            let file_row = self.offset.y + screen_row;
+            let line_bg = if file_row == self.cursor.y {
+                theme.line_bg
+            } else {
+                theme.bg
+            };
+            let mut spans = vec![Span::styled(
+                format!(
+                    "{:>width$} ",
+                    file_row + 1,
+                    width = gutter.saturating_sub(1)
+                ),
+                Style::default().fg(theme.dim_fg).bg(line_bg),
+            )];
+
+            if let Some(line) = self.doc.line(file_row) {
+                let selected = self.selection_range_for_line(file_row, line.chars().count());
+                let (mut content_spans, rendered) = Self::plain_spans_for_window(
+                    line,
+                    self.offset.x,
+                    body_width,
+                    line_bg,
+                    selected,
+                    theme,
+                );
+                spans.append(&mut content_spans);
+                if rendered < body_width {
+                    spans.push(Span::styled(
+                        " ".repeat(body_width - rendered),
+                        Style::default().fg(theme.fg).bg(line_bg),
+                    ));
+                }
+            } else if body_width > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(body_width),
+                    Style::default().fg(theme.fg).bg(line_bg),
+                ));
+            }
+
+            lines.push(Line::from(spans));
+        }
+
+        lines
+    }
+
+    fn plain_spans_for_window(
+        line: &str,
+        offset_x: usize,
+        width: usize,
+        line_bg: Color,
+        selected_range: Option<(usize, usize)>,
+        theme: &Theme,
+    ) -> (Vec<Span<'static>>, usize) {
+        let chars: Vec<char> = line.chars().collect();
+        let line_len = chars.len();
+        let start = cmp::min(offset_x, line_len);
+        let end = cmp::min(start + width, line_len);
+        let mut spans = Vec::new();
+        let mut rendered = 0usize;
+
+        if start < end {
+            let mut current_style = Style::default().fg(theme.fg).bg(line_bg);
+            if selected_range.is_some_and(|(s, e)| (s..e).contains(&start)) {
+                current_style = apply_selection_style(current_style, theme);
+            }
+            let mut segment = String::new();
+
+            for idx in start..end {
+                let mut style = Style::default().fg(theme.fg).bg(line_bg);
+                if selected_range.is_some_and(|(s, e)| (s..e).contains(&idx)) {
+                    style = apply_selection_style(style, theme);
+                }
+                if style != current_style {
+                    let text = std::mem::take(&mut segment);
+                    rendered += text.chars().count();
+                    spans.push(Span::styled(text, current_style));
+                    current_style = style;
+                }
+                segment.push(chars[idx]);
+            }
+
+            if !segment.is_empty() {
+                rendered += segment.chars().count();
+                spans.push(Span::styled(segment, current_style));
+            }
+        }
+
+        (spans, rendered)
+    }
+
+    fn syntect_spans_for_window(
+        highlighted: &[(SyntectStyle, &str)],
+        offset_x: usize,
+        width: usize,
+        line_bg: Color,
+        selected_range: Option<(usize, usize)>,
+        theme: &Theme,
+    ) -> (Vec<Span<'static>>, usize) {
+        let mut spans = Vec::new();
+        let mut rendered = 0usize;
+        let mut line_char_idx = 0usize;
+        let mut current_style: Option<Style> = None;
+        let mut segment = String::new();
+
+        'outer: for (token_style, text) in highlighted {
+            let base_style = style_for_syntect_token(*token_style, line_bg);
+            for ch in text.chars() {
+                if line_char_idx < offset_x {
+                    line_char_idx += 1;
+                    continue;
+                }
+                if rendered >= width {
+                    break 'outer;
+                }
+
+                let mut style = base_style;
+                if selected_range.is_some_and(|(s, e)| (s..e).contains(&line_char_idx)) {
+                    style = apply_selection_style(style, theme);
+                }
+
+                match current_style {
+                    Some(current) if current == style => {}
+                    Some(current) => {
+                        let text = std::mem::take(&mut segment);
+                        spans.push(Span::styled(text, current));
+                        current_style = Some(style);
+                    }
+                    None => current_style = Some(style),
+                }
+
+                segment.push(ch);
+                line_char_idx += 1;
+                rendered += 1;
+            }
+        }
+
+        if let Some(style) = current_style {
+            if !segment.is_empty() {
+                spans.push(Span::styled(segment, style));
+            }
+        }
+
+        (spans, rendered)
+    }
+
+    fn use_markdown_highlighting(&self) -> bool {
+        self.doc
+            .file_path
+            .as_ref()
+            .map_or(true, |path| is_markdown_path(path))
+    }
+
+    fn code_syntax(&self) -> Option<&'static SyntaxReference> {
+        let path = self.doc.file_path.as_ref()?;
+
+        if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+            if let Some(syntax) = SYNTAX_SET.find_syntax_by_token(file_name) {
+                return Some(syntax);
+            }
+        }
+
+        if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
+            if let Some(syntax) = SYNTAX_SET.find_syntax_by_extension(extension) {
+                return Some(syntax);
+            }
+        }
+
+        self.doc
+            .lines
+            .first()
+            .and_then(|line| SYNTAX_SET.find_syntax_by_first_line(line))
+    }
+
+    fn syntect_theme(&self) -> &'static SyntectTheme {
+        let preferred = if self.palette_theme == PaletteTheme::LightPaper {
+            ["InspiredGitHub", "Solarized (light)"]
+        } else {
+            ["base16-ocean.dark", "base16-eighties.dark"]
+        };
+        preferred
+            .iter()
+            .find_map(|name| SYNTAX_THEMES.themes.get(*name))
+            .or_else(|| SYNTAX_THEMES.themes.values().next())
+            .expect("syntect bundled theme set must not be empty")
     }
 
     fn build_preview_lines_for_view(
@@ -1149,6 +1446,37 @@ fn md_style_to_style(style: MdStyle, bg: Color, theme: &Theme) -> Style {
 
 fn style_for_markdown_char(style: MdStyle, bg: Color, theme: &Theme) -> Style {
     md_style_to_style(style, bg, theme)
+}
+
+fn style_for_syntect_token(style: SyntectStyle, bg: Color) -> Style {
+    let mut out = Style::default()
+        .fg(Color::Rgb(
+            style.foreground.r,
+            style.foreground.g,
+            style.foreground.b,
+        ))
+        .bg(bg);
+    if style.font_style.contains(FontStyle::BOLD) {
+        out = out.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        out = out.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        out = out.add_modifier(Modifier::UNDERLINED);
+    }
+    out
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("md")
+                || ext.eq_ignore_ascii_case("markdown")
+                || ext.eq_ignore_ascii_case("mdown")
+                || ext.eq_ignore_ascii_case("mkd")
+        })
 }
 
 fn apply_selection_style(style: Style, theme: &Theme) -> Style {
