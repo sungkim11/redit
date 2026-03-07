@@ -33,6 +33,7 @@ impl Editor {
         setext_heading: bool,
         line_bg: Color,
         selected_range: Option<(usize, usize)>,
+        theme: &Theme,
     ) -> (Vec<Span<'static>>, usize, bool) {
         let chars: Vec<char> = line.chars().collect();
         let indented_code = !in_code_block && is_indented_code_line(line);
@@ -44,16 +45,16 @@ impl Editor {
         let mut rendered = 0usize;
 
         if start < end {
-            let mut current_style = style_for_markdown_char(styles[start], line_bg);
+            let mut current_style = style_for_markdown_char(styles[start], line_bg, theme);
             if selected_range.is_some_and(|(s, e)| (s..e).contains(&start)) {
-                current_style = apply_selection_style(current_style);
+                current_style = apply_selection_style(current_style, theme);
             }
             let mut segment = String::new();
 
             for idx in start..end {
-                let mut style = style_for_markdown_char(styles[idx], line_bg);
+                let mut style = style_for_markdown_char(styles[idx], line_bg, theme);
                 if selected_range.is_some_and(|(s, e)| (s..e).contains(&idx)) {
-                    style = apply_selection_style(style);
+                    style = apply_selection_style(style, theme);
                 }
                 if style != current_style {
                     let text = std::mem::take(&mut segment);
@@ -86,13 +87,14 @@ impl Editor {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::with_capacity(text_height);
         let mut in_code_block = self.code_block_state_before(self.offset.y);
+        let theme = &self.theme;
 
         for screen_row in 0..text_height {
             let file_row = self.offset.y + screen_row;
             let line_bg = if file_row == self.cursor.y {
-                CRT_LINE_BG
+                theme.line_bg
             } else {
-                CRT_BG
+                theme.bg
             };
             let mut spans = vec![Span::styled(
                 format!(
@@ -100,7 +102,7 @@ impl Editor {
                     file_row + 1,
                     width = gutter.saturating_sub(1)
                 ),
-                Style::default().fg(CRT_DIM_FG).bg(line_bg),
+                Style::default().fg(theme.dim_fg).bg(line_bg),
             )];
 
             if let Some(line) = self.doc.line(file_row) {
@@ -116,19 +118,20 @@ impl Editor {
                     setext_heading,
                     line_bg,
                     self.selection_range_for_line(file_row, line.chars().count()),
+                    theme,
                 );
                 spans.append(&mut content_spans);
                 if rendered < body_width {
                     spans.push(Span::styled(
                         " ".repeat(body_width - rendered),
-                        Style::default().fg(CRT_FG).bg(line_bg),
+                        Style::default().fg(theme.fg).bg(line_bg),
                     ));
                 }
                 in_code_block = next_state;
             } else if body_width > 0 {
                 spans.push(Span::styled(
                     " ".repeat(body_width),
-                    Style::default().fg(CRT_FG).bg(line_bg),
+                    Style::default().fg(theme.fg).bg(line_bg),
                 ));
             }
 
@@ -144,16 +147,17 @@ impl Editor {
         preview_width: usize,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::with_capacity(text_height);
+        let theme = &self.theme;
         for screen_row in 0..text_height {
             let file_row = self.offset.y + screen_row;
             if let Some(preview_line) = self.preview_cache_lines.get(file_row) {
                 if self.preview_backend == PreviewBackend::Glow {
-                    let mut line = ansi_to_line_clipped(preview_line, preview_width);
+                    let mut line = ansi_to_line_clipped(preview_line, preview_width, theme);
                     let visible_width = line_char_width(&line);
                     if visible_width < preview_width {
                         line.spans.push(Span::styled(
                             " ".repeat(preview_width - visible_width),
-                            Style::default().fg(CRT_FG).bg(CRT_BG),
+                            Style::default().fg(theme.fg).bg(theme.bg),
                         ));
                     }
                     lines.push(line);
@@ -163,12 +167,12 @@ impl Editor {
                     let visible_width = visible.chars().count();
                     let mut spans = vec![Span::styled(
                         visible,
-                        Style::default().fg(CRT_FG).bg(CRT_BG),
+                        Style::default().fg(theme.fg).bg(theme.bg),
                     )];
                     if visible_width < preview_width {
                         spans.push(Span::styled(
                             " ".repeat(preview_width - visible_width),
-                            Style::default().fg(CRT_FG).bg(CRT_BG),
+                            Style::default().fg(theme.fg).bg(theme.bg),
                         ));
                     }
                     lines.push(Line::from(spans));
@@ -176,12 +180,12 @@ impl Editor {
             } else if preview_width > 0 {
                 let mut spans = vec![Span::styled(
                     "~",
-                    Style::default().fg(CRT_DIM_FG).bg(CRT_BG),
+                    Style::default().fg(theme.dim_fg).bg(theme.bg),
                 )];
                 if preview_width > 1 {
                     spans.push(Span::styled(
                         " ".repeat(preview_width - 1),
-                        Style::default().fg(CRT_FG).bg(CRT_BG),
+                        Style::default().fg(theme.fg).bg(theme.bg),
                     ));
                 }
                 lines.push(Line::from(spans));
@@ -192,21 +196,24 @@ impl Editor {
         lines
     }
 
-    fn build_separator_lines(text_height: usize) -> Vec<Line<'static>> {
+    fn build_separator_lines(&self, text_height: usize) -> Vec<Line<'static>> {
         let separator = clip_to_char_width("│", PREVIEW_SEPARATOR_WIDTH);
+        let theme = &self.theme;
         (0..text_height)
             .map(|_| {
                 Line::styled(
                     pad_or_clip_to_char_width(&separator, PREVIEW_SEPARATOR_WIDTH),
-                    Style::default().fg(CRT_PREVIEW_SEP).bg(CRT_BG),
+                    Style::default().fg(theme.preview_sep).bg(theme.bg),
                 )
             })
             .collect()
     }
 
     fn build_top_menu_line(&self, cols: usize) -> Line<'static> {
-        let base = Style::default().fg(CRT_BAR_FG).bg(CRT_BAR_BG);
-        let active = Style::default().fg(CRT_ACTIVE_FG).bg(CRT_ACTIVE_BG);
+        let base = Style::default().fg(self.theme.bar_fg).bg(self.theme.bar_bg);
+        let active = Style::default()
+            .fg(self.theme.active_fg)
+            .bg(self.theme.active_bg);
         let mut spans = Vec::new();
         let mut used = 0usize;
 
@@ -295,11 +302,12 @@ impl Editor {
             return lines;
         }
 
-        let active_input_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_ACTIVE_BG);
-        let inactive_input_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_BG);
-        let output_style = Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG);
-        let error_style = Style::default().fg(CRT_HEADING_FG).bg(CRT_MENU_BG);
-        let empty_style = Style::default().fg(CRT_DIM_FG).bg(CRT_MENU_BG);
+        let theme = &self.theme;
+        let active_input_style = Style::default().fg(theme.fg).bg(theme.input_active_bg);
+        let inactive_input_style = Style::default().fg(theme.fg).bg(theme.input_bg);
+        let output_style = Style::default().fg(theme.menu_fg).bg(theme.menu_bg);
+        let error_style = Style::default().fg(theme.heading_fg).bg(theme.menu_bg);
+        let empty_style = Style::default().fg(theme.dim_fg).bg(theme.menu_bg);
         let input_style = if self.active_pane == ActivePane::Shell {
             active_input_style
         } else {
@@ -340,13 +348,14 @@ impl Editor {
         let entries = Self::menu_entries(menu);
         let inner_height = rect.height.saturating_sub(2);
         let inner_width = rect.width.saturating_sub(2);
+        let theme = &self.theme;
         (0..inner_height)
             .map(|idx| {
                 let is_selected = idx == self.active_menu_index;
                 let style = if is_selected {
-                    Style::default().fg(CRT_ACTIVE_FG).bg(CRT_ACTIVE_BG)
+                    Style::default().fg(theme.active_fg).bg(theme.active_bg)
                 } else {
-                    Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)
+                    Style::default().fg(theme.menu_fg).bg(theme.menu_bg)
                 };
                 let line = entries
                     .get(idx)
@@ -358,9 +367,10 @@ impl Editor {
 
     fn build_explorer_lines(&self, text_height: usize, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::with_capacity(text_height);
+        let theme = &self.theme;
         for row in 0..text_height {
             if self.explorer_entries.is_empty() {
-                let style = Style::default().fg(CRT_DIM_FG).bg(CRT_BG);
+                let style = Style::default().fg(theme.dim_fg).bg(theme.bg);
                 let line = if row == 0 {
                     " (empty)".to_string()
                 } else {
@@ -375,23 +385,23 @@ impl Editor {
                 let is_selected = idx == self.explorer_selected;
                 let style = if is_selected {
                     if self.active_pane == ActivePane::Explorer {
-                        Style::default().fg(CRT_ACTIVE_FG).bg(CRT_ACTIVE_BG)
+                        Style::default().fg(theme.active_fg).bg(theme.active_bg)
                     } else {
-                        Style::default().fg(CRT_FG).bg(CRT_LINE_BG)
+                        Style::default().fg(theme.fg).bg(theme.line_bg)
                     }
                 } else if entry.is_parent_link {
-                    Style::default().fg(CRT_DIM_FG).bg(CRT_BG)
+                    Style::default().fg(theme.dim_fg).bg(theme.bg)
                 } else if entry.is_dir {
-                    Style::default().fg(CRT_MENU_FG).bg(CRT_BG)
+                    Style::default().fg(theme.menu_fg).bg(theme.bg)
                 } else {
-                    Style::default().fg(CRT_FG).bg(CRT_BG)
+                    Style::default().fg(theme.fg).bg(theme.bg)
                 };
                 let line = format!(" {}", entry.rendered_label);
                 lines.push(Line::styled(pad_or_clip_to_char_width(&line, width), style));
             } else {
                 lines.push(Line::styled(
                     pad_or_clip_to_char_width("", width),
-                    Style::default().fg(CRT_DIM_FG).bg(CRT_BG),
+                    Style::default().fg(theme.dim_fg).bg(theme.bg),
                 ));
             }
         }
@@ -419,10 +429,13 @@ impl Editor {
         );
         let inner_width = width.saturating_sub(2);
         let inner_height = height.saturating_sub(2);
-        let label_style = Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG);
-        let hint_style = Style::default().fg(CRT_DIM_FG).bg(CRT_MENU_BG);
-        let input_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_ACTIVE_BG);
-        let selected_input_style = Style::default().fg(CRT_SELECTION_FG).bg(CRT_SELECTION_BG);
+        let theme = &self.theme;
+        let label_style = Style::default().fg(theme.menu_fg).bg(theme.menu_bg);
+        let hint_style = Style::default().fg(theme.dim_fg).bg(theme.menu_bg);
+        let input_style = Style::default().fg(theme.fg).bg(theme.input_active_bg);
+        let selected_input_style = Style::default()
+            .fg(theme.selection_fg)
+            .bg(theme.selection_bg);
         let field_style = if popup.select_all && !popup.path_input.is_empty() {
             selected_input_style
         } else {
@@ -449,7 +462,7 @@ impl Editor {
         while lines.len() < inner_height {
             lines.push(Line::styled(
                 pad_or_clip_to_char_width("", inner_width),
-                Style::default().bg(CRT_MENU_BG),
+                Style::default().bg(theme.menu_bg),
             ));
         }
         lines.truncate(inner_height);
@@ -494,10 +507,11 @@ impl Editor {
         );
         let inner_width = width.saturating_sub(2);
         let inner_height = height.saturating_sub(2);
-        let label_style = Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG);
-        let hint_style = Style::default().fg(CRT_DIM_FG).bg(CRT_MENU_BG);
-        let active_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_ACTIVE_BG);
-        let inactive_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_BG);
+        let theme = &self.theme;
+        let label_style = Style::default().fg(theme.menu_fg).bg(theme.menu_bg);
+        let hint_style = Style::default().fg(theme.dim_fg).bg(theme.menu_bg);
+        let active_style = Style::default().fg(theme.fg).bg(theme.input_active_bg);
+        let inactive_style = Style::default().fg(theme.fg).bg(theme.input_bg);
 
         let field_line = |value: &str, is_active: bool| -> Line<'static> {
             let style = if is_active {
@@ -518,7 +532,7 @@ impl Editor {
                 lines.push(field_line(&popup.find_input, true));
                 lines.push(Line::styled(
                     pad_or_clip_to_char_width("", inner_width),
-                    Style::default().bg(CRT_MENU_BG),
+                    Style::default().bg(theme.menu_bg),
                 ));
                 lines.push(Line::styled(
                     pad_or_clip_to_char_width(" Enter: find next   Esc: cancel", inner_width),
@@ -552,7 +566,7 @@ impl Editor {
                 ));
                 lines.push(Line::styled(
                     pad_or_clip_to_char_width("", inner_width),
-                    Style::default().bg(CRT_MENU_BG),
+                    Style::default().bg(theme.menu_bg),
                 ));
                 lines.push(Line::styled(
                     pad_or_clip_to_char_width(
@@ -576,7 +590,7 @@ impl Editor {
         while lines.len() < inner_height {
             lines.push(Line::styled(
                 pad_or_clip_to_char_width("", inner_width),
-                Style::default().bg(CRT_MENU_BG),
+                Style::default().bg(theme.menu_bg),
             ));
         }
         lines.truncate(inner_height);
@@ -616,8 +630,9 @@ impl Editor {
         );
         let inner_width = width.saturating_sub(2);
         let inner_height = height.saturating_sub(2);
-        let text_style = Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG);
-        let hint_style = Style::default().fg(CRT_DIM_FG).bg(CRT_MENU_BG);
+        let theme = &self.theme;
+        let text_style = Style::default().fg(theme.menu_fg).bg(theme.menu_bg);
+        let hint_style = Style::default().fg(theme.dim_fg).bg(theme.menu_bg);
 
         let mut lines = popup
             .lines
@@ -635,13 +650,83 @@ impl Editor {
         while lines.len() < inner_height {
             lines.push(Line::styled(
                 pad_or_clip_to_char_width("", inner_width),
-                Style::default().bg(CRT_MENU_BG),
+                Style::default().bg(theme.menu_bg),
             ));
         }
 
         Some(InfoPopupRender {
             rect,
             title: popup.title.clone(),
+            lines,
+        })
+    }
+
+    fn build_palette_popup_render(&self, cols: usize, rows: usize) -> Option<PalettePopupRender> {
+        let popup = self.palette_popup.as_ref()?;
+        if cols < 30 || rows < 10 {
+            return None;
+        }
+
+        let entries = PaletteTheme::ALL
+            .iter()
+            .enumerate()
+            .map(|(idx, theme)| format!(" {}. {}", idx + 1, theme.name()))
+            .collect::<Vec<_>>();
+        let content_width = entries
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = cmp::max(30, cmp::min(content_width + 6, cols.saturating_sub(4)));
+        let desired_height = entries.len() + 4;
+        let height = cmp::max(7, cmp::min(desired_height, rows.saturating_sub(2)));
+        if width >= cols || height >= rows {
+            return None;
+        }
+
+        let rect = Rect::new(
+            ((cols - width) / 2) as u16,
+            ((rows - height) / 2) as u16,
+            width as u16,
+            height as u16,
+        );
+        let inner_width = width.saturating_sub(2);
+        let inner_height = height.saturating_sub(2);
+        let theme = &self.theme;
+        let normal_style = Style::default().fg(theme.menu_fg).bg(theme.menu_bg);
+        let selected_style = Style::default().fg(theme.active_fg).bg(theme.active_bg);
+        let hint_style = Style::default().fg(theme.dim_fg).bg(theme.menu_bg);
+
+        let mut lines = entries
+            .iter()
+            .enumerate()
+            .take(inner_height)
+            .map(|(idx, line)| {
+                let style = if idx == popup.selected {
+                    selected_style
+                } else {
+                    normal_style
+                };
+                Line::styled(pad_or_clip_to_char_width(line, inner_width), style)
+            })
+            .collect::<Vec<_>>();
+
+        if lines.len() < inner_height {
+            lines.push(Line::styled(
+                pad_or_clip_to_char_width(" Enter: apply  Esc: cancel ", inner_width),
+                hint_style,
+            ));
+        }
+        while lines.len() < inner_height {
+            lines.push(Line::styled(
+                pad_or_clip_to_char_width("", inner_width),
+                Style::default().bg(theme.menu_bg),
+            ));
+        }
+
+        Some(PalettePopupRender {
+            rect,
+            title: " Palette ".to_string(),
             lines,
         })
     }
@@ -671,7 +756,7 @@ impl Editor {
         let editor_lines = self.build_editor_lines(text_height, gutter, body_width);
         let shell_lines =
             self.build_shell_pane_lines(shell_outer_height.saturating_sub(2), editor_cols);
-        let separator_lines = preview_layout.map(|_| Self::build_separator_lines(text_height));
+        let separator_lines = preview_layout.map(|_| self.build_separator_lines(text_height));
         let preview_lines = preview_layout.map(|(_, _, preview_width)| {
             self.build_preview_lines_for_view(text_height, preview_width)
         });
@@ -684,6 +769,7 @@ impl Editor {
         let save_as_popup = self.build_save_as_popup_render(cols_usize, rows_usize);
         let search_popup = self.build_search_popup_render(cols_usize, rows_usize);
         let info_popup = self.build_info_popup_render(cols_usize, rows_usize);
+        let palette_popup = self.build_palette_popup_render(cols_usize, rows_usize);
         let explorer_render = explorer_layout.map(|(explorer_width, _separator_width)| {
             let inner_width = explorer_width.saturating_sub(2);
             let lines = self.build_explorer_lines(explorer_text_height, inner_width);
@@ -696,7 +782,7 @@ impl Editor {
         let show_editor_cursor = self.active_pane == ActivePane::Editor
             && cursor_rel_y < text_height
             && cursor_rel_x < editor_cols;
-        let cursor_position = if info_popup.is_some() {
+        let cursor_position = if info_popup.is_some() || palette_popup.is_some() {
             None
         } else if let Some(popup) = &save_as_popup {
             Some(popup.cursor)
@@ -734,7 +820,7 @@ impl Editor {
             frame.render_widget(Clear, full_area);
             frame.render_widget(
                 Paragraph::new(vec![menu_line.clone()])
-                    .style(Style::default().fg(CRT_BAR_FG).bg(CRT_BAR_BG)),
+                    .style(Style::default().fg(self.theme.bar_fg).bg(self.theme.bar_bg)),
                 menu_area,
             );
 
@@ -748,9 +834,11 @@ impl Editor {
             if self.active_pane == ActivePane::Editor {
                 editor_title.push_str(" [focused]");
             }
-            let body_block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_BG));
+            let body_block = Block::default().borders(Borders::ALL).border_style(
+                Style::default()
+                    .fg(self.theme.panel_border)
+                    .bg(self.theme.bg),
+            );
             frame.render_widget(body_block.clone(), body_outer_area);
             let body_area = body_block.inner(body_outer_area);
 
@@ -773,12 +861,16 @@ impl Editor {
                     let explorer_block = Block::default()
                         .title(" Files ")
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_BG));
+                        .border_style(
+                            Style::default()
+                                .fg(self.theme.panel_border)
+                                .bg(self.theme.bg),
+                        );
                     frame.render_widget(explorer_block.clone(), explorer_block_area);
                     let explorer_inner = explorer_block.inner(explorer_block_area);
                     frame.render_widget(
                         Paragraph::new(explorer_lines.clone())
-                            .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
+                            .style(Style::default().fg(self.theme.fg).bg(self.theme.bg)),
                         explorer_inner,
                     );
                     editor_area_origin = body_area.x + editor_start as u16;
@@ -795,7 +887,11 @@ impl Editor {
                     .title(format!(" {editor_title} "))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_BG));
+                    .border_style(
+                        Style::default()
+                            .fg(self.theme.panel_border)
+                            .bg(self.theme.bg),
+                    );
                 let editor_outer_area = Rect::new(
                     editor_base_area.x.saturating_sub(1),
                     editor_base_area.y.saturating_sub(1),
@@ -825,27 +921,30 @@ impl Editor {
 
                     frame.render_widget(
                         Paragraph::new(editor_lines.clone())
-                            .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
+                            .style(Style::default().fg(self.theme.fg).bg(self.theme.bg)),
                         editor_area,
                     );
                     if let Some(lines) = &separator_lines {
                         frame.render_widget(
-                            Paragraph::new(lines.clone())
-                                .style(Style::default().fg(CRT_PREVIEW_SEP).bg(CRT_BG)),
+                            Paragraph::new(lines.clone()).style(
+                                Style::default()
+                                    .fg(self.theme.preview_sep)
+                                    .bg(self.theme.bg),
+                            ),
                             separator_area,
                         );
                     }
                     if let Some(lines) = &preview_lines {
                         frame.render_widget(
                             Paragraph::new(lines.clone())
-                                .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
+                                .style(Style::default().fg(self.theme.fg).bg(self.theme.bg)),
                             preview_area,
                         );
                     }
                 } else {
                     frame.render_widget(
                         Paragraph::new(editor_lines.clone())
-                            .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
+                            .style(Style::default().fg(self.theme.fg).bg(self.theme.bg)),
                         editor_base_area,
                     );
                 }
@@ -859,24 +958,33 @@ impl Editor {
                         " Terminal "
                     })
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                    .border_style(
+                        Style::default()
+                            .fg(self.theme.panel_border)
+                            .bg(self.theme.menu_bg),
+                    );
                 frame.render_widget(shell_block.clone(), shell_area);
                 let shell_inner = shell_block.inner(shell_area);
                 frame.render_widget(
-                    Paragraph::new(shell_lines.clone())
-                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    Paragraph::new(shell_lines.clone()).style(
+                        Style::default()
+                            .fg(self.theme.menu_fg)
+                            .bg(self.theme.menu_bg),
+                    ),
                     shell_inner,
                 );
             }
             frame.render_widget(
                 Paragraph::new(status_line.clone())
-                    .style(Style::default().fg(CRT_BAR_FG).bg(CRT_BAR_BG)),
+                    .style(Style::default().fg(self.theme.bar_fg).bg(self.theme.bar_bg)),
                 status_area,
             );
             let message_style = if message_active {
-                Style::default().fg(CRT_HEADING_FG).bg(CRT_MESSAGE_BG)
+                Style::default()
+                    .fg(self.theme.heading_fg)
+                    .bg(self.theme.message_bg)
             } else {
-                Style::default().fg(CRT_DIM_FG).bg(CRT_BG)
+                Style::default().fg(self.theme.dim_fg).bg(self.theme.bg)
             };
             frame.render_widget(
                 Paragraph::new(message_line.clone()).style(message_style),
@@ -891,9 +999,11 @@ impl Editor {
                     rect.height as u16,
                 );
                 frame.render_widget(Clear, popup);
-                let menu_block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                let menu_block = Block::default().borders(Borders::ALL).border_style(
+                    Style::default()
+                        .fg(self.theme.panel_border)
+                        .bg(self.theme.menu_bg),
+                );
                 frame.render_widget(menu_block.clone(), popup);
                 let inner = menu_block.inner(popup);
                 frame.render_widget(Paragraph::new(lines.clone()), inner);
@@ -904,12 +1014,19 @@ impl Editor {
                 let popup_block = Block::default()
                     .title(popup.title.clone())
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                    .border_style(
+                        Style::default()
+                            .fg(self.theme.panel_border)
+                            .bg(self.theme.menu_bg),
+                    );
                 frame.render_widget(popup_block.clone(), popup.rect);
                 let inner = popup_block.inner(popup.rect);
                 frame.render_widget(
-                    Paragraph::new(popup.lines.clone())
-                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    Paragraph::new(popup.lines.clone()).style(
+                        Style::default()
+                            .fg(self.theme.menu_fg)
+                            .bg(self.theme.menu_bg),
+                    ),
                     inner,
                 );
             }
@@ -919,12 +1036,19 @@ impl Editor {
                 let popup_block = Block::default()
                     .title(popup.title.clone())
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                    .border_style(
+                        Style::default()
+                            .fg(self.theme.panel_border)
+                            .bg(self.theme.menu_bg),
+                    );
                 frame.render_widget(popup_block.clone(), popup.rect);
                 let inner = popup_block.inner(popup.rect);
                 frame.render_widget(
-                    Paragraph::new(popup.lines.clone())
-                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    Paragraph::new(popup.lines.clone()).style(
+                        Style::default()
+                            .fg(self.theme.menu_fg)
+                            .bg(self.theme.menu_bg),
+                    ),
                     inner,
                 );
             }
@@ -934,12 +1058,41 @@ impl Editor {
                 let popup_block = Block::default()
                     .title(popup.title.clone())
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                    .border_style(
+                        Style::default()
+                            .fg(self.theme.panel_border)
+                            .bg(self.theme.menu_bg),
+                    );
                 frame.render_widget(popup_block.clone(), popup.rect);
                 let inner = popup_block.inner(popup.rect);
                 frame.render_widget(
-                    Paragraph::new(popup.lines.clone())
-                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    Paragraph::new(popup.lines.clone()).style(
+                        Style::default()
+                            .fg(self.theme.menu_fg)
+                            .bg(self.theme.menu_bg),
+                    ),
+                    inner,
+                );
+            }
+
+            if let Some(popup) = &palette_popup {
+                frame.render_widget(Clear, popup.rect);
+                let popup_block = Block::default()
+                    .title(popup.title.clone())
+                    .borders(Borders::ALL)
+                    .border_style(
+                        Style::default()
+                            .fg(self.theme.panel_border)
+                            .bg(self.theme.menu_bg),
+                    );
+                frame.render_widget(popup_block.clone(), popup.rect);
+                let inner = popup_block.inner(popup.rect);
+                frame.render_widget(
+                    Paragraph::new(popup.lines.clone()).style(
+                        Style::default()
+                            .fg(self.theme.menu_fg)
+                            .bg(self.theme.menu_bg),
+                    ),
                     inner,
                 );
             }
@@ -959,45 +1112,45 @@ impl Editor {
     }
 }
 
-fn md_style_to_style(style: MdStyle, bg: Color) -> Style {
+fn md_style_to_style(style: MdStyle, bg: Color, theme: &Theme) -> Style {
     match style {
-        MdStyle::Normal => Style::default().fg(CRT_FG).bg(bg),
-        MdStyle::Heading => Style::default().fg(CRT_FG).bg(bg),
+        MdStyle::Normal => Style::default().fg(theme.fg).bg(bg),
+        MdStyle::Heading => Style::default().fg(theme.fg).bg(bg),
         MdStyle::Quote => Style::default()
-            .fg(CRT_FG)
+            .fg(theme.fg)
             .bg(bg)
             .add_modifier(Modifier::ITALIC),
-        MdStyle::Marker => Style::default().fg(CRT_MARKER_FG).bg(CRT_MARKER_BG),
+        MdStyle::Marker => Style::default().fg(theme.marker_fg).bg(theme.marker_bg),
         MdStyle::Code => Style::default()
-            .fg(CRT_FG)
+            .fg(theme.fg)
             .bg(bg)
             .add_modifier(Modifier::DIM),
         MdStyle::Emphasis => Style::default()
-            .fg(CRT_FG)
+            .fg(theme.fg)
             .bg(bg)
             .add_modifier(Modifier::ITALIC),
-        MdStyle::Strong => Style::default().fg(CRT_FG).bg(bg),
+        MdStyle::Strong => Style::default().fg(theme.fg).bg(bg),
         MdStyle::EmphasisStrong => Style::default()
-            .fg(CRT_FG)
+            .fg(theme.fg)
             .bg(bg)
             .add_modifier(Modifier::ITALIC),
         MdStyle::Strike => Style::default()
-            .fg(CRT_FG)
+            .fg(theme.fg)
             .bg(bg)
             .add_modifier(Modifier::DIM),
-        MdStyle::LinkText => Style::default().fg(CRT_FG).bg(bg),
+        MdStyle::LinkText => Style::default().fg(theme.fg).bg(bg),
         MdStyle::LinkUrl => Style::default()
-            .fg(CRT_FG)
+            .fg(theme.fg)
             .bg(bg)
             .add_modifier(Modifier::ITALIC),
-        MdStyle::HtmlTag => Style::default().fg(CRT_HTML_TAG_FG).bg(bg),
+        MdStyle::HtmlTag => Style::default().fg(theme.html_tag_fg).bg(bg),
     }
 }
 
-fn style_for_markdown_char(style: MdStyle, bg: Color) -> Style {
-    md_style_to_style(style, bg)
+fn style_for_markdown_char(style: MdStyle, bg: Color, theme: &Theme) -> Style {
+    md_style_to_style(style, bg, theme)
 }
 
-fn apply_selection_style(style: Style) -> Style {
-    style.fg(CRT_SELECTION_FG).bg(CRT_SELECTION_BG)
+fn apply_selection_style(style: Style, theme: &Theme) -> Style {
+    style.fg(theme.selection_fg).bg(theme.selection_bg)
 }

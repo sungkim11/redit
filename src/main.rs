@@ -63,6 +63,7 @@ enum MenuKind {
     Edit,
     Search,
     View,
+    Tools,
     Help,
 }
 
@@ -104,6 +105,7 @@ enum MenuAction {
     Replace,
     TogglePreview,
     ToggleTerminal,
+    Palette,
     Keybindings,
     About,
 }
@@ -113,11 +115,13 @@ const MENU_ITEMS: &[(MenuKind, &str)] = &[
     (MenuKind::Edit, "Edit"),
     (MenuKind::Search, "Search"),
     (MenuKind::View, "View"),
+    (MenuKind::Tools, "Tools"),
     (MenuKind::Help, "Help"),
 ];
 
 const APP_NAME: &str = "redit";
 const APP_VERSION: &str = "0.1";
+const SETTINGS_FILE: &str = "settings.conf";
 
 const FILE_MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry {
@@ -190,6 +194,12 @@ const VIEW_MENU_ENTRIES: &[MenuEntry] = &[
         action: MenuAction::ToggleTerminal,
     },
 ];
+
+const TOOLS_MENU_ENTRIES: &[MenuEntry] = &[MenuEntry {
+    label: "Palette",
+    mnemonic: 'p',
+    action: MenuAction::Palette,
+}];
 
 const HELP_MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry {
@@ -277,6 +287,18 @@ struct InfoPopupRender {
 }
 
 #[derive(Clone)]
+struct PalettePopupState {
+    selected: usize,
+}
+
+#[derive(Clone)]
+struct PalettePopupRender {
+    rect: Rect,
+    title: String,
+    lines: Vec<Line<'static>>,
+}
+
+#[derive(Clone)]
 struct ShellPopupState {
     input: String,
     cursor: usize,
@@ -298,6 +320,212 @@ enum ActivePane {
     Editor,
     Explorer,
     Shell,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteTheme {
+    MainframeGreen,
+    BlackWhite,
+    Amber,
+    OceanBlue,
+    LightPaper,
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: Color,
+    fg: Color,
+    dim_fg: Color,
+    bar_bg: Color,
+    bar_fg: Color,
+    active_bg: Color,
+    active_fg: Color,
+    menu_bg: Color,
+    menu_fg: Color,
+    heading_fg: Color,
+    html_tag_fg: Color,
+    marker_fg: Color,
+    marker_bg: Color,
+    line_bg: Color,
+    panel_border: Color,
+    preview_sep: Color,
+    message_bg: Color,
+    input_bg: Color,
+    input_active_bg: Color,
+    selection_bg: Color,
+    selection_fg: Color,
+}
+
+impl PaletteTheme {
+    const ALL: [PaletteTheme; 5] = [
+        PaletteTheme::MainframeGreen,
+        PaletteTheme::BlackWhite,
+        PaletteTheme::Amber,
+        PaletteTheme::OceanBlue,
+        PaletteTheme::LightPaper,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            PaletteTheme::MainframeGreen => "Mainframe Green",
+            PaletteTheme::BlackWhite => "Black & White",
+            PaletteTheme::Amber => "Amber",
+            PaletteTheme::OceanBlue => "Ocean Blue",
+            PaletteTheme::LightPaper => "Light Paper",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|theme| *theme == self)
+            .unwrap_or(0)
+    }
+
+    fn from_index(index: usize) -> Self {
+        Self::ALL[index % Self::ALL.len()]
+    }
+
+    fn settings_value(self) -> &'static str {
+        match self {
+            PaletteTheme::MainframeGreen => "mainframe_green",
+            PaletteTheme::BlackWhite => "black_white",
+            PaletteTheme::Amber => "amber",
+            PaletteTheme::OceanBlue => "ocean_blue",
+            PaletteTheme::LightPaper => "light_paper",
+        }
+    }
+
+    fn from_settings_value(value: &str) -> Option<Self> {
+        match value {
+            "mainframe_green" => Some(PaletteTheme::MainframeGreen),
+            "black_white" => Some(PaletteTheme::BlackWhite),
+            "amber" => Some(PaletteTheme::Amber),
+            "ocean_blue" => Some(PaletteTheme::OceanBlue),
+            "light_paper" => Some(PaletteTheme::LightPaper),
+            _ => None,
+        }
+    }
+
+    fn theme(self) -> Theme {
+        match self {
+            PaletteTheme::MainframeGreen => Theme {
+                bg: CRT_BG,
+                fg: CRT_FG,
+                dim_fg: CRT_DIM_FG,
+                bar_bg: CRT_BAR_BG,
+                bar_fg: CRT_BAR_FG,
+                active_bg: CRT_ACTIVE_BG,
+                active_fg: CRT_ACTIVE_FG,
+                menu_bg: CRT_MENU_BG,
+                menu_fg: CRT_MENU_FG,
+                heading_fg: CRT_HEADING_FG,
+                html_tag_fg: CRT_HTML_TAG_FG,
+                marker_fg: CRT_MARKER_FG,
+                marker_bg: CRT_MARKER_BG,
+                line_bg: CRT_LINE_BG,
+                panel_border: CRT_PANEL_BORDER,
+                preview_sep: CRT_PREVIEW_SEP,
+                message_bg: CRT_MESSAGE_BG,
+                input_bg: CRT_INPUT_BG,
+                input_active_bg: CRT_INPUT_ACTIVE_BG,
+                selection_bg: CRT_SELECTION_BG,
+                selection_fg: CRT_SELECTION_FG,
+            },
+            PaletteTheme::BlackWhite => Theme {
+                bg: Color::Black,
+                fg: Color::White,
+                dim_fg: Color::Rgb(170, 170, 170),
+                bar_bg: Color::Rgb(32, 32, 32),
+                bar_fg: Color::White,
+                active_bg: Color::White,
+                active_fg: Color::Black,
+                menu_bg: Color::Rgb(18, 18, 18),
+                menu_fg: Color::White,
+                heading_fg: Color::Rgb(170, 170, 255),
+                html_tag_fg: Color::Rgb(180, 180, 255),
+                marker_fg: Color::Rgb(170, 170, 255),
+                marker_bg: Color::Rgb(30, 30, 30),
+                line_bg: Color::Rgb(12, 12, 12),
+                panel_border: Color::Rgb(200, 200, 200),
+                preview_sep: Color::Rgb(110, 110, 110),
+                message_bg: Color::Rgb(24, 24, 24),
+                input_bg: Color::Rgb(16, 16, 16),
+                input_active_bg: Color::Rgb(30, 30, 30),
+                selection_bg: Color::Rgb(70, 70, 70),
+                selection_fg: Color::White,
+            },
+            PaletteTheme::Amber => Theme {
+                bg: Color::Rgb(20, 10, 2),
+                fg: Color::Rgb(255, 236, 190),
+                dim_fg: Color::Rgb(201, 147, 70),
+                bar_bg: Color::Rgb(78, 41, 10),
+                bar_fg: Color::Rgb(255, 221, 160),
+                active_bg: Color::Rgb(255, 204, 120),
+                active_fg: Color::Black,
+                menu_bg: Color::Rgb(44, 22, 6),
+                menu_fg: Color::Rgb(255, 210, 133),
+                heading_fg: Color::Rgb(255, 189, 102),
+                html_tag_fg: Color::Rgb(255, 174, 79),
+                marker_fg: Color::Rgb(255, 160, 54),
+                marker_bg: Color::Rgb(59, 27, 5),
+                line_bg: Color::Rgb(27, 13, 3),
+                panel_border: Color::Rgb(201, 132, 38),
+                preview_sep: Color::Rgb(150, 95, 25),
+                message_bg: Color::Rgb(35, 17, 5),
+                input_bg: Color::Rgb(28, 14, 4),
+                input_active_bg: Color::Rgb(49, 24, 6),
+                selection_bg: Color::Rgb(134, 80, 8),
+                selection_fg: Color::Rgb(255, 244, 224),
+            },
+            PaletteTheme::OceanBlue => Theme {
+                bg: Color::Rgb(4, 10, 22),
+                fg: Color::Rgb(230, 242, 255),
+                dim_fg: Color::Rgb(112, 156, 214),
+                bar_bg: Color::Rgb(12, 39, 82),
+                bar_fg: Color::Rgb(196, 226, 255),
+                active_bg: Color::Rgb(133, 188, 255),
+                active_fg: Color::Rgb(4, 20, 51),
+                menu_bg: Color::Rgb(7, 24, 51),
+                menu_fg: Color::Rgb(173, 212, 255),
+                heading_fg: Color::Rgb(122, 198, 255),
+                html_tag_fg: Color::Rgb(129, 184, 255),
+                marker_fg: Color::Rgb(107, 168, 255),
+                marker_bg: Color::Rgb(10, 28, 64),
+                line_bg: Color::Rgb(7, 18, 40),
+                panel_border: Color::Rgb(91, 151, 222),
+                preview_sep: Color::Rgb(59, 116, 191),
+                message_bg: Color::Rgb(9, 22, 46),
+                input_bg: Color::Rgb(8, 20, 43),
+                input_active_bg: Color::Rgb(14, 33, 70),
+                selection_bg: Color::Rgb(43, 93, 170),
+                selection_fg: Color::Rgb(245, 250, 255),
+            },
+            PaletteTheme::LightPaper => Theme {
+                bg: Color::Rgb(248, 247, 241),
+                fg: Color::Rgb(34, 39, 46),
+                dim_fg: Color::Rgb(101, 109, 124),
+                bar_bg: Color::Rgb(217, 221, 230),
+                bar_fg: Color::Rgb(35, 39, 46),
+                active_bg: Color::Rgb(86, 132, 210),
+                active_fg: Color::Rgb(255, 255, 255),
+                menu_bg: Color::Rgb(232, 235, 242),
+                menu_fg: Color::Rgb(47, 57, 69),
+                heading_fg: Color::Rgb(38, 104, 189),
+                html_tag_fg: Color::Rgb(46, 117, 211),
+                marker_fg: Color::Rgb(47, 108, 189),
+                marker_bg: Color::Rgb(220, 229, 242),
+                line_bg: Color::Rgb(237, 239, 244),
+                panel_border: Color::Rgb(123, 140, 163),
+                preview_sep: Color::Rgb(151, 167, 188),
+                message_bg: Color::Rgb(227, 231, 239),
+                input_bg: Color::Rgb(231, 235, 243),
+                input_active_bg: Color::Rgb(212, 222, 240),
+                selection_bg: Color::Rgb(72, 124, 204),
+                selection_fg: Color::Rgb(255, 255, 255),
+            },
+        }
+    }
 }
 
 impl SearchPopupState {
@@ -363,6 +591,8 @@ struct Editor {
     preview_cache_revision: u64,
     preview_backend: PreviewBackend,
     preview_error: Option<String>,
+    palette_theme: PaletteTheme,
+    theme: Theme,
     explorer_root: PathBuf,
     explorer_entries: Vec<ExplorerEntry>,
     explorer_selected: usize,
@@ -377,6 +607,7 @@ struct Editor {
     save_as_popup: Option<SaveAsPopupState>,
     search_popup: Option<SearchPopupState>,
     info_popup: Option<InfoPopupState>,
+    palette_popup: Option<PalettePopupState>,
     shell_popup: Option<ShellPopupState>,
     last_search_query: String,
     should_quit: bool,
@@ -411,6 +642,7 @@ impl Editor {
             .filter(|path| !path.as_os_str().is_empty())
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
+        let palette_theme = Self::load_palette_theme_setting();
 
         let mut editor = Self {
             terminal: TerminalGuard::new()?,
@@ -428,6 +660,8 @@ impl Editor {
             preview_cache_revision: 0,
             preview_backend: PreviewBackend::Fallback,
             preview_error: None,
+            palette_theme,
+            theme: palette_theme.theme(),
             explorer_root,
             explorer_entries: Vec::new(),
             explorer_selected: 0,
@@ -442,6 +676,7 @@ impl Editor {
             save_as_popup: None,
             search_popup: None,
             info_popup: None,
+            palette_popup: None,
             shell_popup: Some(Self::default_terminal_state()),
             last_search_query: String::new(),
             should_quit: false,
@@ -476,6 +711,13 @@ impl Editor {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.palette_popup.is_some() {
+            if self.handle_palette_popup_key(key) {
+                self.scroll();
+                return;
+            }
+        }
+
         if self.info_popup.is_some() {
             if self.handle_info_popup_key(key) {
                 self.scroll();
@@ -800,11 +1042,31 @@ impl Editor {
             MenuKind::Edit => "Edit menu opened",
             MenuKind::Search => "Search menu opened",
             MenuKind::View => "View menu opened",
+            MenuKind::Tools => "Tools menu opened",
             MenuKind::Help => "Help menu opened",
         });
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.palette_popup.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let col = usize::from(mouse.column);
+                let row = usize::from(mouse.row);
+                let (cols, rows) = terminal::size().unwrap_or((80, 24));
+                let cols = usize::from(cols);
+                let rows = usize::from(rows);
+                if let Some(index) = self.palette_index_from_mouse(col, row, cols, rows) {
+                    if let Some(popup) = self.palette_popup.as_mut() {
+                        popup.selected = index;
+                    }
+                    self.apply_selected_palette();
+                } else {
+                    self.palette_popup = None;
+                }
+            }
+            return;
+        }
+
         if self.info_popup.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.info_popup = None;
@@ -901,6 +1163,60 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    fn palette_popup_rect(&self, cols: usize, rows: usize) -> Option<Rect> {
+        if self.palette_popup.is_none() || cols < 30 || rows < 10 {
+            return None;
+        }
+
+        let content_width = PaletteTheme::ALL
+            .iter()
+            .enumerate()
+            .map(|(idx, theme)| format!(" {}. {}", idx + 1, theme.name()).chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = cmp::max(30, cmp::min(content_width + 6, cols.saturating_sub(4)));
+        let desired_height = PaletteTheme::ALL.len() + 4;
+        let height = cmp::max(7, cmp::min(desired_height, rows.saturating_sub(2)));
+        if width >= cols || height >= rows {
+            return None;
+        }
+
+        Some(Rect::new(
+            ((cols - width) / 2) as u16,
+            ((rows - height) / 2) as u16,
+            width as u16,
+            height as u16,
+        ))
+    }
+
+    fn palette_index_from_mouse(
+        &self,
+        column: usize,
+        row: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Option<usize> {
+        let rect = self.palette_popup_rect(cols, rows)?;
+        let left = usize::from(rect.x);
+        let top = usize::from(rect.y);
+        let width = usize::from(rect.width);
+        let height = usize::from(rect.height);
+
+        if column <= left
+            || column >= left + width.saturating_sub(1)
+            || row <= top
+            || row >= top + height.saturating_sub(1)
+        {
+            return None;
+        }
+
+        let inner_row = row.saturating_sub(top + 1);
+        if inner_row >= PaletteTheme::ALL.len() {
+            return None;
+        }
+        Some(inner_row)
     }
 
     fn shell_pane_outer_height(&self, rows: usize) -> usize {
@@ -1081,6 +1397,7 @@ impl Editor {
             MenuKind::Edit => EDIT_MENU_ENTRIES,
             MenuKind::Search => SEARCH_MENU_ENTRIES,
             MenuKind::View => VIEW_MENU_ENTRIES,
+            MenuKind::Tools => TOOLS_MENU_ENTRIES,
             MenuKind::Help => HELP_MENU_ENTRIES,
         }
     }
@@ -1091,6 +1408,7 @@ impl Editor {
             'e' => Some(MenuKind::Edit),
             's' => Some(MenuKind::Search),
             'v' => Some(MenuKind::View),
+            't' => Some(MenuKind::Tools),
             'h' => Some(MenuKind::Help),
             _ => None,
         }
@@ -1231,6 +1549,7 @@ impl Editor {
             MenuAction::Replace => self.open_replace_popup(),
             MenuAction::TogglePreview => self.toggle_preview(),
             MenuAction::ToggleTerminal => self.toggle_terminal_pane(),
+            MenuAction::Palette => self.open_palette_popup(),
             MenuAction::Keybindings => self.open_info_popup(
                 " Keybindings ",
                 vec![
@@ -1243,6 +1562,7 @@ impl Editor {
                     "Ctrl-P Toggle Markdown",
                     "Ctrl-F Find",
                     "Ctrl-R Replace",
+                    "Tools > Palette Theme",
                 ],
             ),
             MenuAction::About => self.open_info_popup(
@@ -1260,6 +1580,7 @@ impl Editor {
             title: title.into(),
             lines: lines.into_iter().map(Into::into).collect(),
         });
+        self.palette_popup = None;
         self.save_as_popup = None;
         self.search_popup = None;
         self.active_menu = None;
@@ -1278,6 +1599,125 @@ impl Editor {
             _ => {}
         }
         true
+    }
+
+    fn open_palette_popup(&mut self) {
+        self.palette_popup = Some(PalettePopupState {
+            selected: self.palette_theme.index(),
+        });
+        self.info_popup = None;
+        self.save_as_popup = None;
+        self.search_popup = None;
+        self.active_menu = None;
+        self.active_menu_index = 0;
+    }
+
+    fn handle_palette_popup_key(&mut self, key: KeyEvent) -> bool {
+        if self.palette_popup.is_none() {
+            return false;
+        }
+
+        let len = PaletteTheme::ALL.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.palette_popup = None;
+            }
+            KeyCode::Up => {
+                if let Some(popup) = self.palette_popup.as_mut() {
+                    popup.selected = popup.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(popup) = self.palette_popup.as_mut() {
+                    popup.selected = cmp::min(popup.selected + 1, len.saturating_sub(1));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(popup) = self.palette_popup.as_mut() {
+                    popup.selected = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(popup) = self.palette_popup.as_mut() {
+                    popup.selected = len.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                self.apply_selected_palette();
+            }
+            KeyCode::Char(c) if ('1'..='9').contains(&c) => {
+                let idx = (c as u8 - b'1') as usize;
+                if idx < len {
+                    if let Some(popup) = self.palette_popup.as_mut() {
+                        popup.selected = idx;
+                    }
+                    self.apply_selected_palette();
+                }
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    fn apply_selected_palette(&mut self) {
+        let Some(popup) = self.palette_popup.clone() else {
+            return;
+        };
+        let selected = PaletteTheme::from_index(popup.selected);
+        self.palette_theme = selected;
+        self.theme = selected.theme();
+        self.palette_popup = None;
+        match Self::save_palette_theme_setting(selected) {
+            Ok(()) => {
+                self.status = StatusMessage::new(format!("Palette changed to {}.", selected.name()))
+            }
+            Err(err) => {
+                self.status = StatusMessage::new(format!(
+                    "Palette changed to {} (settings not saved: {err}).",
+                    selected.name()
+                ));
+            }
+        }
+    }
+
+    fn load_palette_theme_setting() -> PaletteTheme {
+        let Some(path) = Self::settings_path() else {
+            return PaletteTheme::MainframeGreen;
+        };
+        let Ok(contents) = fs::read_to_string(path) else {
+            return PaletteTheme::MainframeGreen;
+        };
+
+        contents
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                if key.trim() != "palette" {
+                    return None;
+                }
+                PaletteTheme::from_settings_value(value.trim())
+            })
+            .unwrap_or(PaletteTheme::MainframeGreen)
+    }
+
+    fn save_palette_theme_setting(theme: PaletteTheme) -> io::Result<()> {
+        let Some(path) = Self::settings_path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, format!("palette={}\n", theme.settings_value()))
+    }
+
+    fn settings_path() -> Option<PathBuf> {
+        if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(path).join(APP_NAME).join(SETTINGS_FILE));
+        }
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".config").join(APP_NAME).join(SETTINGS_FILE))
     }
 
     fn current_snapshot(&self) -> EditorSnapshot {
@@ -2892,14 +3332,14 @@ fn line_char_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
-fn ansi_to_line_clipped(text: &str, width: usize) -> Line<'static> {
+fn ansi_to_line_clipped(text: &str, width: usize, theme: &Theme) -> Line<'static> {
     if width == 0 {
         return Line::raw(String::new());
     }
 
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut current_style = Style::default().fg(CRT_FG).bg(CRT_BG);
+    let mut current_style = Style::default().fg(theme.fg).bg(theme.bg);
     let mut buffer = String::new();
     let mut visible = 0usize;
     let mut i = 0usize;
@@ -2920,7 +3360,7 @@ fn ansi_to_line_clipped(text: &str, width: usize) -> Line<'static> {
                 let c = chars[i];
                 if c.is_ascii_alphabetic() {
                     if c == 'm' {
-                        apply_sgr_sequence(&seq, &mut current_style);
+                        apply_sgr_sequence(&seq, &mut current_style, theme);
                     }
                     i += 1;
                     break;
@@ -2943,7 +3383,7 @@ fn ansi_to_line_clipped(text: &str, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
-fn apply_sgr_sequence(seq: &str, style: &mut Style) {
+fn apply_sgr_sequence(seq: &str, style: &mut Style, theme: &Theme) {
     let params: Vec<Option<u16>> = if seq.is_empty() {
         vec![Some(0)]
     } else {
@@ -2962,7 +3402,7 @@ fn apply_sgr_sequence(seq: &str, style: &mut Style) {
     while i < params.len() {
         let code = params[i].unwrap_or(0);
         match code {
-            0 => *style = Style::default().fg(CRT_FG).bg(CRT_BG),
+            0 => *style = Style::default().fg(theme.fg).bg(theme.bg),
             1 => *style = style.add_modifier(Modifier::BOLD),
             2 => *style = style.add_modifier(Modifier::DIM),
             3 => *style = style.add_modifier(Modifier::ITALIC),
@@ -2972,10 +3412,10 @@ fn apply_sgr_sequence(seq: &str, style: &mut Style) {
             24 => *style = style.remove_modifier(Modifier::UNDERLINED),
             30..=37 => *style = style.fg(Color::Indexed((code - 30) as u8)),
             90..=97 => *style = style.fg(Color::Indexed((code - 90 + 8) as u8)),
-            39 => *style = style.fg(CRT_FG),
+            39 => *style = style.fg(theme.fg),
             40..=47 => *style = style.bg(Color::Indexed((code - 40) as u8)),
             100..=107 => *style = style.bg(Color::Indexed((code - 100 + 8) as u8)),
-            49 => *style = style.bg(CRT_BG),
+            49 => *style = style.bg(theme.bg),
             38 | 48 => {
                 let is_fg = code == 38;
                 if i + 1 < params.len() {
