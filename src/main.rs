@@ -1287,10 +1287,10 @@ impl Editor {
         if row < shell_inner_top || row > shell_input_row {
             return None;
         }
+        if column < shell_inner_left || column >= shell_inner_right {
+            return None;
+        }
         if row == shell_input_row {
-            if column < shell_inner_left || column >= shell_inner_right {
-                return Some(0);
-            }
             let input_offset = column - shell_inner_left;
             let prompt_width = 2usize;
             Some(input_offset.saturating_sub(prompt_width))
