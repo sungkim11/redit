@@ -3,7 +3,7 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::terminal;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -127,15 +127,9 @@ impl Editor {
                 in_code_block = next_state;
             } else if body_width > 0 {
                 spans.push(Span::styled(
-                    "~",
-                    Style::default().fg(CRT_DIM_FG).bg(line_bg),
+                    " ".repeat(body_width),
+                    Style::default().fg(CRT_FG).bg(line_bg),
                 ));
-                if body_width > 1 {
-                    spans.push(Span::styled(
-                        " ".repeat(body_width - 1),
-                        Style::default().fg(CRT_FG).bg(line_bg),
-                    ));
-                }
             }
 
             lines.push(Line::from(spans));
@@ -260,16 +254,14 @@ impl Editor {
     fn status_bar_line(&self, cols: usize) -> String {
         let name = self.doc.file_name_or_default();
         let modified = if self.doc.modified { " (modified)" } else { "" };
-        let preview = if self.preview_mode {
-            match self.preview_backend {
-                PreviewBackend::Glow => "Preview:Glow",
-                PreviewBackend::Fallback => "Preview:Fallback",
-            }
+        let markdown_preview = if self.preview_mode { "On" } else { "Off" };
+        let terminal_status = if self.shell_popup.is_some() {
+            "On"
         } else {
-            "Preview:OFF"
+            "Off"
         };
         let left = format!(
-            " {name} | {} lines | {} words{modified} | {preview}",
+            " {name} | {} lines | {} words{modified} | Markdown Preview: {markdown_preview} | Terminal: {terminal_status}",
             self.doc.line_count(),
             self.doc.word_count()
         );
@@ -314,21 +306,12 @@ impl Editor {
             inactive_input_style
         };
 
-        let (input_line, output_lines) = if let Some(shell) = self.shell_popup.as_ref() {
-            (format!("$ {}", shell.input), shell.output_lines.as_slice())
-        } else {
-            ("$ ".to_string(), &[][..])
-        };
-        lines.push(Line::styled(
-            pad_or_clip_to_char_width(&input_line, width),
-            input_style,
-        ));
+        let (input_line, output_lines) = self.shell_popup.as_ref().map_or_else(
+            || ("$ ".to_string(), &[][..]),
+            |shell| (format!("$ {}", shell.input), shell.output_lines.as_slice()),
+        );
 
         let output_rows = text_height.saturating_sub(1);
-        if output_rows == 0 {
-            return lines;
-        }
-
         let start = output_lines.len().saturating_sub(output_rows);
         for line in output_lines.iter().skip(start).take(output_rows) {
             let style = if line.starts_with("! ") {
@@ -339,18 +322,17 @@ impl Editor {
             lines.push(Line::styled(pad_or_clip_to_char_width(line, width), style));
         }
 
-        while lines.len() < text_height {
-            let empty = if lines.len() == 1 {
-                " Enter: run  Ctrl+L: clear output  F3: focus shell "
-            } else {
-                ""
-            };
+        while lines.len() < output_rows {
             lines.push(Line::styled(
-                pad_or_clip_to_char_width(empty, width),
+                pad_or_clip_to_char_width("", width),
                 empty_style,
             ));
         }
 
+        lines.push(Line::styled(
+            pad_or_clip_to_char_width(&input_line, width),
+            input_style,
+        ));
         lines
     }
 
@@ -574,7 +556,7 @@ impl Editor {
                 ));
                 lines.push(Line::styled(
                     pad_or_clip_to_char_width(
-                        " Tab: next field   Enter: apply   Esc: cancel",
+                        " Tab: next field   Enter: replace next   Esc: cancel",
                         inner_width,
                     ),
                     hint_style,
@@ -607,14 +589,73 @@ impl Editor {
         })
     }
 
+    fn build_info_popup_render(&self, cols: usize, rows: usize) -> Option<InfoPopupRender> {
+        let popup = self.info_popup.as_ref()?;
+        if cols < 28 || rows < 8 {
+            return None;
+        }
+
+        let content_width = popup
+            .lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0);
+        let width = cmp::max(28, cmp::min(content_width + 6, cols.saturating_sub(4)));
+        let desired_height = popup.lines.len() + 4;
+        let height = cmp::max(6, cmp::min(desired_height, rows.saturating_sub(2)));
+        if width >= cols || height >= rows {
+            return None;
+        }
+
+        let rect = Rect::new(
+            ((cols - width) / 2) as u16,
+            ((rows - height) / 2) as u16,
+            width as u16,
+            height as u16,
+        );
+        let inner_width = width.saturating_sub(2);
+        let inner_height = height.saturating_sub(2);
+        let text_style = Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG);
+        let hint_style = Style::default().fg(CRT_DIM_FG).bg(CRT_MENU_BG);
+
+        let mut lines = popup
+            .lines
+            .iter()
+            .take(inner_height)
+            .map(|line| Line::styled(pad_or_clip_to_char_width(line, inner_width), text_style))
+            .collect::<Vec<_>>();
+
+        if lines.len() < inner_height {
+            lines.push(Line::styled(
+                pad_or_clip_to_char_width(" Esc/Enter: close ", inner_width),
+                hint_style,
+            ));
+        }
+        while lines.len() < inner_height {
+            lines.push(Line::styled(
+                pad_or_clip_to_char_width("", inner_width),
+                Style::default().bg(CRT_MENU_BG),
+            ));
+        }
+
+        Some(InfoPopupRender {
+            rect,
+            title: popup.title.clone(),
+            lines,
+        })
+    }
+
     pub(crate) fn refresh_screen(&mut self) -> io::Result<()> {
         let (cols, rows) = terminal::size()?;
         let cols_usize = usize::from(cols);
         let rows_usize = usize::from(rows);
         let shell_outer_height = self.shell_pane_outer_height(rows_usize);
         let editor_outer_height = self.editor_outer_height_for_rows(rows_usize);
+        let explorer_outer_height = self.explorer_outer_height_for_rows(rows_usize);
         let text_height = self.editor_text_height_for_rows(rows_usize);
-        self.ensure_explorer_selection_visible(text_height);
+        let explorer_text_height = self.explorer_text_height_for_rows(rows_usize);
+        self.ensure_explorer_selection_visible(explorer_text_height);
         let inner_width = cols_usize.saturating_sub(2);
         let explorer_layout = self.explorer_layout(inner_width);
         let editor_start = self.editor_start_x(inner_width);
@@ -629,7 +670,7 @@ impl Editor {
         let menu_line = self.build_top_menu_line(cols_usize);
         let editor_lines = self.build_editor_lines(text_height, gutter, body_width);
         let shell_lines =
-            self.build_shell_pane_lines(shell_outer_height.saturating_sub(2), inner_width);
+            self.build_shell_pane_lines(shell_outer_height.saturating_sub(2), editor_cols);
         let separator_lines = preview_layout.map(|_| Self::build_separator_lines(text_height));
         let preview_lines = preview_layout.map(|(_, _, preview_width)| {
             self.build_preview_lines_for_view(text_height, preview_width)
@@ -642,16 +683,11 @@ impl Editor {
         });
         let save_as_popup = self.build_save_as_popup_render(cols_usize, rows_usize);
         let search_popup = self.build_search_popup_render(cols_usize, rows_usize);
-        let explorer_render = explorer_layout.map(|(explorer_width, separator_width)| {
-            let root_name = self
-                .explorer_root
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map_or("/", |name| name)
-                .to_string();
+        let info_popup = self.build_info_popup_render(cols_usize, rows_usize);
+        let explorer_render = explorer_layout.map(|(explorer_width, _separator_width)| {
             let inner_width = explorer_width.saturating_sub(2);
-            let lines = self.build_explorer_lines(text_height, inner_width);
-            (explorer_width, separator_width, root_name, lines)
+            let lines = self.build_explorer_lines(explorer_text_height, inner_width);
+            (explorer_width, lines)
         });
         let cursor_rel_x = self.cursor.x.saturating_sub(self.offset.x) + gutter;
         let cursor_rel_y = self.cursor.y.saturating_sub(self.offset.y);
@@ -660,15 +696,18 @@ impl Editor {
         let show_editor_cursor = self.active_pane == ActivePane::Editor
             && cursor_rel_y < text_height
             && cursor_rel_x < editor_cols;
-        let cursor_position = if let Some(popup) = &save_as_popup {
+        let cursor_position = if info_popup.is_some() {
+            None
+        } else if let Some(popup) = &save_as_popup {
             Some(popup.cursor)
         } else if let Some(popup) = &search_popup {
             Some(popup.cursor)
         } else if self.active_pane == ActivePane::Shell {
             self.shell_popup.as_ref().map(|shell| {
                 let shell_outer_y = 1 + editor_outer_height;
-                let cursor_x = 1 + cmp::min(2 + shell.cursor, inner_width.saturating_sub(1));
-                let cursor_y = shell_outer_y + 1;
+                let cursor_x =
+                    editor_start + 1 + cmp::min(2 + shell.cursor, editor_cols.saturating_sub(1));
+                let cursor_y = shell_outer_y + shell_outer_height.saturating_sub(2);
                 (cursor_x as u16, cursor_y as u16)
             })
         } else if show_editor_cursor {
@@ -681,12 +720,12 @@ impl Editor {
         self.terminal.terminal.draw(|frame| {
             let full_area = frame.area();
             let menu_area = Rect::new(0, 0, full_area.width, 1);
-            let body_outer_height = editor_outer_height as u16;
+            let body_outer_height = explorer_outer_height as u16;
             let body_outer_area = Rect::new(0, 1, full_area.width, body_outer_height);
             let shell_area = Rect::new(
-                0,
-                1 + body_outer_height,
-                full_area.width,
+                editor_start as u16,
+                1 + editor_outer_height as u16,
+                full_area.width.saturating_sub(editor_start as u16),
                 shell_outer_height as u16,
             );
             let status_area = Rect::new(0, full_area.height.saturating_sub(2), full_area.width, 1);
@@ -699,15 +738,17 @@ impl Editor {
                 menu_area,
             );
 
-            let mut panel_title = self.doc.file_name_or_default();
+            let mut editor_title = self.doc.file_name_or_default();
             if self.doc.modified {
-                panel_title.push_str(" *");
+                editor_title.push_str(" *");
             }
             if preview_layout.is_some() {
-                panel_title.push_str(" | Split Preview");
+                editor_title.push_str(" | Split Markdown Preview");
+            }
+            if self.active_pane == ActivePane::Editor {
+                editor_title.push_str(" [focused]");
             }
             let body_block = Block::default()
-                .title(format!(" {panel_title} "))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_BG));
             frame.render_widget(body_block.clone(), body_outer_area);
@@ -716,45 +757,29 @@ impl Editor {
             if body_area.height > 0 && body_area.width > 0 {
                 let mut editor_area_origin = body_area.x;
                 let mut editor_area_width = body_area.width;
-                if let Some((explorer_width, separator_width, root_name, explorer_lines)) =
-                    &explorer_render
-                {
-                    let explorer_area = Rect::new(
+                if let Some((explorer_width, explorer_lines)) = &explorer_render {
+                    let explorer_inner_area = Rect::new(
                         body_area.x,
                         body_area.y,
                         *explorer_width as u16,
                         body_area.height,
                     );
-                    let separator_area = Rect::new(
-                        body_area.x + *explorer_width as u16,
-                        body_area.y,
-                        *separator_width as u16,
-                        body_area.height,
+                    let explorer_block_area = Rect::new(
+                        explorer_inner_area.x.saturating_sub(1),
+                        explorer_inner_area.y.saturating_sub(1),
+                        explorer_inner_area.width.saturating_add(2),
+                        explorer_inner_area.height.saturating_add(2),
                     );
                     let explorer_block = Block::default()
-                        .title(format!(" Files: {root_name} "))
+                        .title(" Files ")
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_BG));
-                    frame.render_widget(explorer_block.clone(), explorer_area);
-                    let explorer_inner = explorer_block.inner(explorer_area);
+                    frame.render_widget(explorer_block.clone(), explorer_block_area);
+                    let explorer_inner = explorer_block.inner(explorer_block_area);
                     frame.render_widget(
                         Paragraph::new(explorer_lines.clone())
                             .style(Style::default().fg(CRT_FG).bg(CRT_BG)),
                         explorer_inner,
-                    );
-                    let separator_text = pad_or_clip_to_char_width("│", *separator_width);
-                    let separator_lines = (0..body_area.height)
-                        .map(|_| {
-                            Line::styled(
-                                separator_text.clone(),
-                                Style::default().fg(CRT_PREVIEW_SEP).bg(CRT_BG),
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    frame.render_widget(
-                        Paragraph::new(separator_lines)
-                            .style(Style::default().fg(CRT_PREVIEW_SEP).bg(CRT_BG)),
-                        separator_area,
                     );
                     editor_area_origin = body_area.x + editor_start as u16;
                     editor_area_width = body_area.width.saturating_sub(editor_start as u16);
@@ -764,8 +789,20 @@ impl Editor {
                     editor_area_origin,
                     body_area.y,
                     editor_area_width,
-                    body_area.height,
+                    text_height as u16,
                 );
+                let editor_block = Block::default()
+                    .title(format!(" {editor_title} "))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_BG));
+                let editor_outer_area = Rect::new(
+                    editor_base_area.x.saturating_sub(1),
+                    editor_base_area.y.saturating_sub(1),
+                    editor_base_area.width.saturating_add(2),
+                    editor_base_area.height.saturating_add(2),
+                );
+                frame.render_widget(editor_block, editor_outer_area);
                 if let Some((separator_x, preview_x, _)) = preview_layout {
                     let editor_area = Rect::new(
                         editor_base_area.x,
@@ -814,21 +851,23 @@ impl Editor {
                 }
             }
 
-            let shell_block = Block::default()
-                .title(if self.active_pane == ActivePane::Shell {
-                    " Shell [focused] "
-                } else {
-                    " Shell "
-                })
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
-            frame.render_widget(shell_block.clone(), shell_area);
-            let shell_inner = shell_block.inner(shell_area);
-            frame.render_widget(
-                Paragraph::new(shell_lines.clone())
-                    .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
-                shell_inner,
-            );
+            if shell_outer_height > 0 {
+                let shell_block = Block::default()
+                    .title(if self.active_pane == ActivePane::Shell {
+                        " Terminal [focused] "
+                    } else {
+                        " Terminal "
+                    })
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                frame.render_widget(shell_block.clone(), shell_area);
+                let shell_inner = shell_block.inner(shell_area);
+                frame.render_widget(
+                    Paragraph::new(shell_lines.clone())
+                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    shell_inner,
+                );
+            }
             frame.render_widget(
                 Paragraph::new(status_line.clone())
                     .style(Style::default().fg(CRT_BAR_FG).bg(CRT_BAR_BG)),
@@ -876,6 +915,21 @@ impl Editor {
             }
 
             if let Some(popup) = &save_as_popup {
+                frame.render_widget(Clear, popup.rect);
+                let popup_block = Block::default()
+                    .title(popup.title.clone())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                frame.render_widget(popup_block.clone(), popup.rect);
+                let inner = popup_block.inner(popup.rect);
+                frame.render_widget(
+                    Paragraph::new(popup.lines.clone())
+                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    inner,
+                );
+            }
+
+            if let Some(popup) = &info_popup {
                 frame.render_widget(Clear, popup.rect);
                 let popup_block = Block::default()
                     .title(popup.title.clone())

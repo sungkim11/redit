@@ -103,7 +103,7 @@ enum MenuAction {
     Find,
     Replace,
     TogglePreview,
-    FocusShell,
+    ToggleTerminal,
     Keybindings,
     About,
 }
@@ -180,14 +180,14 @@ const SEARCH_MENU_ENTRIES: &[MenuEntry] = &[
 
 const VIEW_MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry {
-        label: "Toggle Preview Ctrl+P",
+        label: "Markdown     Ctrl+P",
         mnemonic: 'p',
         action: MenuAction::TogglePreview,
     },
     MenuEntry {
-        label: "Focus Shell  F3",
-        mnemonic: 's',
-        action: MenuAction::FocusShell,
+        label: "Terminal     F3",
+        mnemonic: 't',
+        action: MenuAction::ToggleTerminal,
     },
 ];
 
@@ -198,7 +198,7 @@ const HELP_MENU_ENTRIES: &[MenuEntry] = &[
         action: MenuAction::Keybindings,
     },
     MenuEntry {
-        label: "About redit v0.1",
+        label: "About redit",
         mnemonic: 'a',
         action: MenuAction::About,
     },
@@ -209,6 +209,10 @@ const PREVIEW_SEPARATOR_WIDTH: usize = 1;
 const EXPLORER_WIDTH: usize = 28;
 const EXPLORER_MIN_WIDTH: usize = 8;
 const EXPLORER_SEPARATOR_WIDTH: usize = 1;
+const TOP_BAR_ROWS: usize = 1;
+const FOOTER_ROWS: usize = 2;
+const MIN_EDITOR_OUTER_HEIGHT: usize = 3;
+const MIN_TERMINAL_OUTER_HEIGHT: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewBackend {
@@ -257,6 +261,19 @@ struct SaveAsPopupRender {
     title: String,
     lines: Vec<Line<'static>>,
     cursor: (u16, u16),
+}
+
+#[derive(Clone)]
+struct InfoPopupState {
+    title: String,
+    lines: Vec<String>,
+}
+
+#[derive(Clone)]
+struct InfoPopupRender {
+    rect: Rect,
+    title: String,
+    lines: Vec<Line<'static>>,
 }
 
 #[derive(Clone)]
@@ -359,6 +376,7 @@ struct Editor {
     mouse_drag_anchor: Option<Position>,
     save_as_popup: Option<SaveAsPopupState>,
     search_popup: Option<SearchPopupState>,
+    info_popup: Option<InfoPopupState>,
     shell_popup: Option<ShellPopupState>,
     last_search_query: String,
     should_quit: bool,
@@ -366,6 +384,14 @@ struct Editor {
 }
 
 impl Editor {
+    fn default_terminal_state() -> ShellPopupState {
+        ShellPopupState {
+            input: String::new(),
+            cursor: 0,
+            output_lines: Vec::new(),
+        }
+    }
+
     fn new(file_arg: Option<PathBuf>) -> io::Result<Self> {
         let opened_path = file_arg.as_ref().and_then(|path| {
             if Path::new(path).exists() {
@@ -392,7 +418,7 @@ impl Editor {
             cursor: Position::default(),
             offset: Position::default(),
             status: StatusMessage::new(
-                "F2: explorer | F3: shell | Ctrl-S save | Ctrl-Q quit | F1 help",
+                "F2: explorer | F3: terminal | Ctrl-S save | Ctrl-Q quit | F1 help",
             ),
             active_menu: None,
             active_menu_index: 0,
@@ -415,11 +441,8 @@ impl Editor {
             mouse_drag_anchor: None,
             save_as_popup: None,
             search_popup: None,
-            shell_popup: Some(ShellPopupState {
-                input: String::new(),
-                cursor: 0,
-                output_lines: vec!["Run a shell command and press Enter.".to_string()],
-            }),
+            info_popup: None,
+            shell_popup: Some(Self::default_terminal_state()),
             last_search_query: String::new(),
             should_quit: false,
             quit_warning_countdown: 1,
@@ -453,6 +476,13 @@ impl Editor {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.info_popup.is_some() {
+            if self.handle_info_popup_key(key) {
+                self.scroll();
+                return;
+            }
+        }
+
         if self.save_as_popup.is_some() {
             if self.handle_save_as_popup_key(key) {
                 self.scroll();
@@ -492,7 +522,7 @@ impl Editor {
             KeyEvent {
                 code: KeyCode::F(3),
                 ..
-            } => self.focus_shell_pane(),
+            } => self.toggle_terminal_pane(),
             KeyEvent {
                 code: KeyCode::F(2),
                 ..
@@ -775,6 +805,13 @@ impl Editor {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.info_popup.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.info_popup = None;
+            }
+            return;
+        }
+
         if self.search_popup.is_some() || self.save_as_popup.is_some() {
             return;
         }
@@ -867,16 +904,45 @@ impl Editor {
     }
 
     fn shell_pane_outer_height(&self, rows: usize) -> usize {
-        let reserved = 1usize + 2usize + 3usize;
-        if rows <= reserved {
-            1
+        if self.shell_popup.is_none() {
+            return 0;
+        }
+
+        let available = self.pane_available_height(rows);
+        if available == 0 {
+            return 0;
+        }
+
+        let desired = (available + 2) / 4;
+        if available >= MIN_EDITOR_OUTER_HEIGHT + MIN_TERMINAL_OUTER_HEIGHT {
+            desired.clamp(
+                MIN_TERMINAL_OUTER_HEIGHT,
+                available.saturating_sub(MIN_EDITOR_OUTER_HEIGHT),
+            )
         } else {
-            cmp::min(6, rows - reserved)
+            desired.max(1).min(available.saturating_sub(1))
         }
     }
 
     fn editor_outer_height_for_rows(&self, rows: usize) -> usize {
-        rows.saturating_sub(1 + 2 + self.shell_pane_outer_height(rows))
+        let available = self.pane_available_height(rows);
+        if self.shell_popup.is_none() {
+            available
+        } else {
+            available.saturating_sub(self.shell_pane_outer_height(rows))
+        }
+    }
+
+    fn pane_available_height(&self, rows: usize) -> usize {
+        rows.saturating_sub(TOP_BAR_ROWS + FOOTER_ROWS)
+    }
+
+    fn explorer_outer_height_for_rows(&self, rows: usize) -> usize {
+        self.editor_outer_height_for_rows(rows) + self.shell_pane_outer_height(rows)
+    }
+
+    fn explorer_text_height_for_rows(&self, rows: usize) -> usize {
+        self.explorer_outer_height_for_rows(rows).saturating_sub(2)
     }
 
     fn editor_text_height_for_rows(&self, rows: usize) -> usize {
@@ -890,20 +956,26 @@ impl Editor {
         cols: usize,
         rows: usize,
     ) -> Option<usize> {
+        let inner_width = cols.saturating_sub(2);
+        let editor_start = self.editor_start_x(inner_width);
+        let editor_cols = self.editor_total_width(inner_width);
         let shell_height = self.shell_pane_outer_height(rows);
         if shell_height < 2 {
             return None;
         }
         let shell_outer_y = 1 + self.editor_outer_height_for_rows(rows);
-        let shell_inner_y = shell_outer_y + 1;
-        if row < shell_inner_y || row >= shell_outer_y + shell_height - 1 {
+        let shell_inner_top = shell_outer_y + 1;
+        let shell_input_row = shell_outer_y + shell_height.saturating_sub(2);
+        let shell_inner_left = 1 + editor_start;
+        let shell_inner_right = shell_inner_left + editor_cols;
+        if row < shell_inner_top || row > shell_input_row {
             return None;
         }
-        if row == shell_inner_y {
-            if column < 1 || column >= cols.saturating_sub(1) {
+        if row == shell_input_row {
+            if column < shell_inner_left || column >= shell_inner_right {
                 return Some(0);
             }
-            let input_offset = column - 1;
+            let input_offset = column - shell_inner_left;
             let prompt_width = 2usize;
             Some(input_offset.saturating_sub(prompt_width))
         } else {
@@ -965,7 +1037,7 @@ impl Editor {
         rows: usize,
     ) -> Option<usize> {
         let inner_width = cols.saturating_sub(2);
-        let text_height = self.editor_text_height_for_rows(rows);
+        let text_height = self.explorer_text_height_for_rows(rows);
         if text_height == 0 || row < 2 || row >= 2 + text_height {
             return None;
         }
@@ -1158,18 +1230,54 @@ impl Editor {
             MenuAction::Find => self.open_find_popup(),
             MenuAction::Replace => self.open_replace_popup(),
             MenuAction::TogglePreview => self.toggle_preview(),
-            MenuAction::FocusShell => self.focus_shell_pane(),
-            MenuAction::Keybindings => {
-                self.status = StatusMessage::new(
-                    "Shortcuts: F2 explorer, F3 shell, Ctrl-S/Shift-S save, Ctrl-Q quit, Ctrl-P preview.",
-                );
-            }
-            MenuAction::About => {
-                self.status = StatusMessage::new(format!(
-                    "{APP_NAME} v{APP_VERSION}: terminal markup editor prototype in Rust."
-                ));
-            }
+            MenuAction::ToggleTerminal => self.toggle_terminal_pane(),
+            MenuAction::Keybindings => self.open_info_popup(
+                " Keybindings ",
+                vec![
+                    "F1 Help menu",
+                    "F2 Focus Files/Editor",
+                    "F3 Toggle Terminal",
+                    "Ctrl-S Save",
+                    "Ctrl-Shift-S Save As",
+                    "Ctrl-Q Quit",
+                    "Ctrl-P Toggle Markdown",
+                    "Ctrl-F Find",
+                    "Ctrl-R Replace",
+                ],
+            ),
+            MenuAction::About => self.open_info_popup(
+                " About redit ",
+                vec![
+                    format!("{APP_NAME} v{APP_VERSION}"),
+                    "Terminal markdown editor prototype in Rust.".to_string(),
+                ],
+            ),
         }
+    }
+
+    fn open_info_popup<T: Into<String>>(&mut self, title: impl Into<String>, lines: Vec<T>) {
+        self.info_popup = Some(InfoPopupState {
+            title: title.into(),
+            lines: lines.into_iter().map(Into::into).collect(),
+        });
+        self.save_as_popup = None;
+        self.search_popup = None;
+        self.active_menu = None;
+        self.active_menu_index = 0;
+    }
+
+    fn handle_info_popup_key(&mut self, key: KeyEvent) -> bool {
+        if self.info_popup.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') => {
+                self.info_popup = None;
+            }
+            _ => {}
+        }
+        true
     }
 
     fn current_snapshot(&self) -> EditorSnapshot {
@@ -1640,23 +1748,25 @@ impl Editor {
                 }
 
                 self.last_search_query = popup.find_input.clone();
-                self.replace_all_occurrences(&popup.find_input, &popup.replace_input);
-                self.search_popup = None;
+                self.replace_next_occurrence(&popup.find_input, &popup.replace_input);
             }
         }
     }
 
-    fn focus_shell_pane(&mut self) {
+    fn toggle_terminal_pane(&mut self) {
         self.save_as_popup = None;
         self.search_popup = None;
         self.active_menu = None;
         self.active_menu_index = 0;
-        if self.active_pane == ActivePane::Shell {
+
+        if self.shell_popup.is_some() {
+            self.shell_popup = None;
             self.active_pane = ActivePane::Editor;
-            self.status = StatusMessage::new("Shell focus cleared.");
+            self.status = StatusMessage::new("Terminal hidden.");
         } else {
+            self.shell_popup = Some(Self::default_terminal_state());
             self.active_pane = ActivePane::Shell;
-            self.status = StatusMessage::new("Shell focused.");
+            self.status = StatusMessage::new("Terminal shown.");
         }
     }
 
@@ -1668,13 +1778,15 @@ impl Editor {
         match key {
             KeyEvent {
                 code: KeyCode::Esc, ..
+            } => {
+                self.active_pane = ActivePane::Editor;
+                self.status = StatusMessage::new("Terminal focus cleared.");
             }
-            | KeyEvent {
+            KeyEvent {
                 code: KeyCode::F(3),
                 ..
             } => {
-                self.active_pane = ActivePane::Editor;
-                self.status = StatusMessage::new("Shell focus cleared.");
+                self.toggle_terminal_pane();
             }
             KeyEvent {
                 code: KeyCode::Enter,
@@ -1791,7 +1903,7 @@ impl Editor {
         };
         let command = popup.input.trim();
         if command.is_empty() {
-            self.status = StatusMessage::new("Shell command cannot be empty.");
+            self.status = StatusMessage::new("Terminal command cannot be empty.");
             return;
         }
 
@@ -1815,26 +1927,39 @@ impl Editor {
                 if let Some(state) = self.shell_popup.as_mut() {
                     state.input.clear();
                     state.cursor = 0;
-                    state.output_lines = lines;
+                    state.output_lines.push(format!("$ {command}"));
+                    state.output_lines.extend(lines);
+                    let keep = 500usize;
+                    if state.output_lines.len() > keep {
+                        let drop_count = state.output_lines.len() - keep;
+                        state.output_lines.drain(0..drop_count);
+                    }
                 }
 
                 if output.status.success() {
-                    self.status = StatusMessage::new(format!("Shell command succeeded: {command}"));
+                    self.status =
+                        StatusMessage::new(format!("Terminal command succeeded: {command}"));
                 } else {
                     let code = output
                         .status
                         .code()
                         .map_or_else(|| "signal".to_string(), |code| code.to_string());
                     self.status = StatusMessage::new(format!(
-                        "Shell command failed (code {code}): {command}"
+                        "Terminal command failed (code {code}): {command}"
                     ));
                 }
             }
             Err(err) => {
                 if let Some(state) = self.shell_popup.as_mut() {
-                    state.output_lines = vec![format!("Shell error: {err}")];
+                    state.output_lines.push(format!("$ {command}"));
+                    state.output_lines.push(format!("Terminal error: {err}"));
+                    let keep = 500usize;
+                    if state.output_lines.len() > keep {
+                        let drop_count = state.output_lines.len() - keep;
+                        state.output_lines.drain(0..drop_count);
+                    }
                 }
-                self.status = StatusMessage::new(format!("Shell command failed: {err}"));
+                self.status = StatusMessage::new(format!("Terminal command failed: {err}"));
             }
         }
     }
@@ -1884,30 +2009,51 @@ impl Editor {
         None
     }
 
-    fn replace_all_occurrences(&mut self, query: &str, replacement: &str) {
+    fn count_occurrences(&self, query: &str) -> usize {
+        self.doc
+            .lines
+            .iter()
+            .map(|line| line.match_indices(query).count())
+            .sum()
+    }
+
+    fn replace_next_occurrence(&mut self, query: &str, replacement: &str) {
         if query.is_empty() {
             self.status = StatusMessage::new("Find text cannot be empty.");
             return;
         }
 
-        let mut total = 0usize;
-        for line in &self.doc.lines {
-            total += line.match_indices(query).count();
-        }
-        if total == 0 {
-            self.status = StatusMessage::new(format!("No matches for \"{query}\"."));
+        let found = self
+            .find_from(query, self.cursor.y, self.cursor.x)
+            .or_else(|| self.find_from(query, 0, 0));
+        let Some(pos) = found else {
+            self.status = StatusMessage::new(format!("No matches for \"{query}\". 0 remaining."));
             return;
-        }
+        };
 
         self.begin_edit();
-        for line in &mut self.doc.lines {
-            if line.contains(query) {
-                *line = line.replace(query, replacement);
+        if let Some(line) = self.doc.lines.get_mut(pos.y) {
+            let query_len = query.chars().count();
+            let start = byte_index_for_char(line, pos.x);
+            let end = byte_index_for_char(line, pos.x + query_len);
+            if start <= end && end <= line.len() {
+                line.replace_range(start..end, replacement);
             }
         }
+
         self.doc.modified = true;
+        self.clear_selection();
+        self.cursor = Position {
+            x: pos.x + replacement.chars().count(),
+            y: pos.y,
+        };
         self.clamp_cursor_to_document();
-        self.status = StatusMessage::new(format!("Replaced {total} occurrence(s) of \"{query}\"."));
+        self.scroll();
+
+        let remaining = self.count_occurrences(query);
+        self.status = StatusMessage::new(format!(
+            "Replaced 1 occurrence of \"{query}\". {remaining} remaining."
+        ));
     }
 
     fn toggle_preview(&mut self) {
@@ -2231,11 +2377,13 @@ impl Editor {
         parent: Option<PathBuf>,
     ) {
         let expanded = is_dir && self.explorer_expanded_dirs.contains(&path);
-        let branch = if is_last { "`- " } else { "|- " };
-        let marker = if is_dir {
-            if expanded { "[-] " } else { "[+] " }
+        let (branch, marker) = if is_dir {
+            (
+                if is_last { "`- " } else { "|- " },
+                if expanded { "[-] " } else { "[+] " },
+            )
         } else {
-            "    "
+            ("", "       ")
         };
         out.push(ExplorerEntry {
             rendered_label: format!("{prefix}{branch}{marker}{name}"),
@@ -2279,7 +2427,8 @@ impl Editor {
     }
 
     fn explorer_visible_rows(&self) -> usize {
-        self.text_area_height()
+        let (_, rows) = terminal::size().unwrap_or((80, 24));
+        self.explorer_text_height_for_rows(usize::from(rows))
     }
 
     fn move_explorer_up(&mut self) {
