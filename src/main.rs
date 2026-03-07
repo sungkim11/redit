@@ -1118,21 +1118,27 @@ impl Editor {
                     return;
                 }
 
-                if let Some(index) = self.explorer_index_from_mouse(col, row, cols, rows) {
+                if self.explorer_contains_mouse(col, row, cols, rows) {
                     self.active_pane = ActivePane::Explorer;
-                    self.explorer_selected = index;
-                    self.ensure_explorer_selection_visible(self.explorer_visible_rows());
-                    let now = Instant::now();
-                    let double_clicked =
-                        self.last_explorer_click
-                            .is_some_and(|(last_index, last_at)| {
-                                last_index == index
-                                    && now.duration_since(last_at) <= Duration::from_millis(500)
-                            });
-                    self.last_explorer_click = Some((index, now));
-                    if double_clicked {
-                        self.open_explorer_selected();
+                    if let Some(index) = self.explorer_index_from_mouse(col, row, cols, rows) {
+                        self.explorer_selected = index;
+                        self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+                        let now = Instant::now();
+                        let double_clicked =
+                            self.last_explorer_click
+                                .is_some_and(|(last_index, last_at)| {
+                                    last_index == index
+                                        && now.duration_since(last_at)
+                                            <= Duration::from_millis(500)
+                                });
+                        self.last_explorer_click = Some((index, now));
+                        if double_clicked {
+                            self.open_explorer_selected();
+                        }
+                    } else {
+                        self.last_explorer_click = None;
                     }
+                    self.mouse_drag_anchor = None;
                     return;
                 }
 
@@ -1367,6 +1373,31 @@ impl Editor {
 
         let idx = self.explorer_offset + (row - 2);
         (idx < self.explorer_entries.len()).then_some(idx)
+    }
+
+    fn explorer_contains_mouse(
+        &self,
+        column: usize,
+        row: usize,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        let inner_width = cols.saturating_sub(2);
+        let outer_height = self.explorer_outer_height_for_rows(rows);
+        if outer_height == 0 {
+            return false;
+        }
+
+        let Some((explorer_width, _)) = self.explorer_layout(inner_width) else {
+            return false;
+        };
+
+        let outer_left = 0usize;
+        let outer_right = explorer_width.saturating_add(2);
+        let outer_top = 1usize;
+        let outer_bottom = outer_top.saturating_add(outer_height);
+
+        (outer_left..outer_right).contains(&column) && (outer_top..outer_bottom).contains(&row)
     }
 
     fn menu_at_column(&self, column: usize) -> Option<MenuKind> {
@@ -2532,7 +2563,9 @@ impl Editor {
 
     fn editor_start_x(&self, cols: usize) -> usize {
         self.explorer_layout(cols)
-            .map_or(0, |(width, separator)| width + separator)
+            // Reserve one extra column so the explorer right border and editor left border
+            // don't overlap, which can visually drop the explorer border.
+            .map_or(0, |(width, separator)| width + separator + 1)
     }
 
     fn editor_total_width(&self, cols: usize) -> usize {

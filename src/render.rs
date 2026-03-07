@@ -1155,8 +1155,17 @@ impl Editor {
                         explorer_inner_area.width.saturating_add(2),
                         explorer_inner_area.height.saturating_add(2),
                     );
+                    let explorer_title = if self.active_pane == ActivePane::Explorer {
+                        if *explorer_width >= " Files [focused] ".chars().count() {
+                            " Files [focused] "
+                        } else {
+                            " Files* "
+                        }
+                    } else {
+                        " Files "
+                    };
                     let explorer_block = Block::default()
-                        .title(" Files ")
+                        .title(explorer_title)
                         .borders(Borders::ALL)
                         .border_style(
                             Style::default()
