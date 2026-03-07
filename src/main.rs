@@ -29,10 +29,16 @@ fn main() -> io::Result<()> {
     editor.run()
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct Position {
     x: usize,
     y: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SelectionRange {
+    start: Position,
+    end: Position,
 }
 
 struct StatusMessage {
@@ -187,6 +193,10 @@ impl Document {
             .file_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("redit.md"));
+        self.save_as(path)
+    }
+
+    fn save_as(&mut self, path: PathBuf) -> io::Result<PathBuf> {
         let mut text = self.lines.join("\n");
         if text.is_empty() {
             text.push('\n');
@@ -229,9 +239,19 @@ struct MenuRect {
     height: usize,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct EditorSnapshot {
+    lines: Vec<String>,
+    cursor: Position,
+    offset: Position,
+    selection_anchor: Option<Position>,
+    modified: bool,
+}
+
 #[derive(Clone, Copy)]
 enum MenuAction {
     Save,
+    SaveAs,
     Quit,
     Undo,
     Redo,
@@ -252,11 +272,19 @@ const MENU_ITEMS: &[(MenuKind, &str)] = &[
     (MenuKind::Help, "Help"),
 ];
 
+const APP_NAME: &str = "redit";
+const APP_VERSION: &str = "0.1";
+
 const FILE_MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry {
         label: "Save        Ctrl+S",
         mnemonic: 's',
         action: MenuAction::Save,
+    },
+    MenuEntry {
+        label: "Save As...  Ctrl+Shift+S",
+        mnemonic: 'a',
+        action: MenuAction::SaveAs,
     },
     MenuEntry {
         label: "Quit        Ctrl+Q",
@@ -318,7 +346,7 @@ const HELP_MENU_ENTRIES: &[MenuEntry] = &[
         action: MenuAction::TogglePreview,
     },
     MenuEntry {
-        label: "About redit",
+        label: "About redit v0.1",
         mnemonic: 'a',
         action: MenuAction::About,
     },
@@ -331,6 +359,76 @@ const PREVIEW_SEPARATOR_WIDTH: usize = 1;
 enum PreviewBackend {
     Glow,
     Fallback,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchPopupMode {
+    Find,
+    Replace,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchPopupField {
+    Find,
+    Replace,
+}
+
+#[derive(Clone)]
+struct SearchPopupState {
+    mode: SearchPopupMode,
+    find_input: String,
+    replace_input: String,
+    active_field: SearchPopupField,
+}
+
+#[derive(Clone)]
+struct SearchPopupRender {
+    rect: Rect,
+    title: String,
+    lines: Vec<Line<'static>>,
+    cursor: (u16, u16),
+}
+
+#[derive(Clone)]
+struct SaveAsPopupState {
+    path_input: String,
+    cursor: usize,
+    select_all: bool,
+}
+
+#[derive(Clone)]
+struct SaveAsPopupRender {
+    rect: Rect,
+    title: String,
+    lines: Vec<Line<'static>>,
+    cursor: (u16, u16),
+}
+
+impl SearchPopupState {
+    fn find(initial_query: &str) -> Self {
+        Self {
+            mode: SearchPopupMode::Find,
+            find_input: initial_query.to_string(),
+            replace_input: String::new(),
+            active_field: SearchPopupField::Find,
+        }
+    }
+
+    fn replace(initial_query: &str) -> Self {
+        Self {
+            mode: SearchPopupMode::Replace,
+            find_input: initial_query.to_string(),
+            replace_input: String::new(),
+            active_field: SearchPopupField::Find,
+        }
+    }
+
+    fn active_field_mut(&mut self) -> &mut String {
+        match self.active_field {
+            SearchPopupField::Find => &mut self.find_input,
+            SearchPopupField::Replace => &mut self.replace_input,
+        }
+    }
 }
 
 const CRT_BG: Color = Color::Rgb(2, 12, 4);
@@ -350,6 +448,10 @@ const CRT_LINE_BG: Color = Color::Rgb(9, 24, 12);
 const CRT_PANEL_BORDER: Color = Color::Rgb(64, 164, 94);
 const CRT_PREVIEW_SEP: Color = Color::Rgb(47, 120, 68);
 const CRT_MESSAGE_BG: Color = Color::Rgb(11, 33, 17);
+const CRT_INPUT_BG: Color = Color::Rgb(4, 24, 12);
+const CRT_INPUT_ACTIVE_BG: Color = Color::Rgb(7, 18, 44);
+const CRT_SELECTION_BG: Color = Color::Rgb(18, 72, 184);
+const CRT_SELECTION_FG: Color = Color::Rgb(255, 255, 255);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MdStyle {
@@ -386,6 +488,14 @@ struct Editor {
     preview_cache_revision: u64,
     preview_backend: PreviewBackend,
     preview_error: Option<String>,
+    clipboard: String,
+    undo_stack: Vec<EditorSnapshot>,
+    redo_stack: Vec<EditorSnapshot>,
+    selection_anchor: Option<Position>,
+    mouse_drag_anchor: Option<Position>,
+    save_as_popup: Option<SaveAsPopupState>,
+    search_popup: Option<SearchPopupState>,
+    last_search_query: String,
     should_quit: bool,
     quit_warning_countdown: u8,
 }
@@ -404,7 +514,7 @@ impl Editor {
             cursor: Position::default(),
             offset: Position::default(),
             status: StatusMessage::new(
-                "Alt-F/E/S/H: menus | Ctrl-S save | Ctrl-Q quit | Ctrl-P preview | F1 help",
+                "Alt-F/E/S/H menus | Ctrl-S save | Ctrl-Q quit | Shift+Arrows select | F1 help",
             ),
             active_menu: None,
             active_menu_index: 0,
@@ -414,6 +524,14 @@ impl Editor {
             preview_cache_revision: 0,
             preview_backend: PreviewBackend::Fallback,
             preview_error: None,
+            clipboard: String::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            selection_anchor: None,
+            mouse_drag_anchor: None,
+            save_as_popup: None,
+            search_popup: None,
+            last_search_query: String::new(),
             should_quit: false,
             quit_warning_countdown: 1,
         })
@@ -444,6 +562,20 @@ impl Editor {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.save_as_popup.is_some() {
+            if self.handle_save_as_popup_key(key) {
+                self.scroll();
+                return;
+            }
+        }
+
+        if self.search_popup.is_some() {
+            if self.handle_search_popup_key(key) {
+                self.scroll();
+                return;
+            }
+        }
+
         if let Some(menu) = self.active_menu {
             if self.handle_menu_mode_key(menu, key) {
                 self.scroll();
@@ -461,7 +593,9 @@ impl Editor {
             } if modifiers.contains(KeyModifiers::ALT) => self.handle_alt_menu(c),
             KeyEvent {
                 code: KeyCode::Esc, ..
-            } => {}
+            } => {
+                self.clear_selection();
+            }
             KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers,
@@ -470,10 +604,20 @@ impl Editor {
                 self.invoke_menu_action(MenuAction::Quit)
             }
             KeyEvent {
-                code: KeyCode::Char('s'),
+                code: KeyCode::Char(c),
                 modifiers,
                 ..
-            } if modifiers.contains(KeyModifiers::CONTROL) => {
+            } if modifiers.contains(KeyModifiers::CONTROL)
+                && modifiers.contains(KeyModifiers::SHIFT)
+                && c.eq_ignore_ascii_case(&'s') =>
+            {
+                self.invoke_menu_action(MenuAction::SaveAs)
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'s') => {
                 self.invoke_menu_action(MenuAction::Save)
             }
             KeyEvent {
@@ -538,49 +682,69 @@ impl Editor {
             } => self.invoke_menu_action(MenuAction::Keybindings),
             KeyEvent {
                 code: KeyCode::Left,
+                modifiers,
                 ..
-            } => self.move_cursor_left(),
+            } => self.move_cursor_left_with_selection(shift_only(modifiers)),
             KeyEvent {
                 code: KeyCode::Right,
+                modifiers,
                 ..
-            } => self.move_cursor_right(),
+            } => self.move_cursor_right_with_selection(shift_only(modifiers)),
             KeyEvent {
-                code: KeyCode::Up, ..
-            } => self.move_cursor_up(),
+                code: KeyCode::Up,
+                modifiers,
+                ..
+            } => self.move_cursor_up_with_selection(shift_only(modifiers)),
             KeyEvent {
                 code: KeyCode::Down,
+                modifiers,
                 ..
-            } => self.move_cursor_down(),
+            } => self.move_cursor_down_with_selection(shift_only(modifiers)),
             KeyEvent {
                 code: KeyCode::PageUp,
+                modifiers,
                 ..
-            } => self.page_up(),
+            } => self.page_up_with_selection(shift_only(modifiers)),
             KeyEvent {
                 code: KeyCode::PageDown,
+                modifiers,
                 ..
-            } => self.page_down(),
+            } => self.page_down_with_selection(shift_only(modifiers)),
             KeyEvent {
                 code: KeyCode::Home,
+                modifiers,
                 ..
-            } => self.cursor.x = 0,
+            } => self.home_with_selection(shift_only(modifiers)),
             KeyEvent {
-                code: KeyCode::End, ..
-            } => self.cursor.x = self.doc.line_char_len(self.cursor.y),
+                code: KeyCode::End,
+                modifiers,
+                ..
+            } => self.end_with_selection(shift_only(modifiers)),
             KeyEvent {
                 code: KeyCode::Backspace,
                 ..
-            } => self.backspace(),
+            } => {
+                self.begin_edit();
+                self.backspace();
+            }
             KeyEvent {
                 code: KeyCode::Delete,
                 ..
-            } => self.doc.delete_forward(self.cursor),
+            } => {
+                self.begin_edit();
+                self.delete_forward();
+            }
             KeyEvent {
                 code: KeyCode::Enter,
                 ..
-            } => self.insert_newline(),
+            } => {
+                self.begin_edit();
+                self.insert_newline();
+            }
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => {
+                self.begin_edit();
                 for _ in 0..4 {
                     self.insert_char(' ');
                 }
@@ -590,6 +754,7 @@ impl Editor {
                 modifiers,
                 ..
             } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.begin_edit();
                 self.insert_char(c)
             }
             _ => {}
@@ -691,7 +856,7 @@ impl Editor {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
+        if self.search_popup.is_some() || self.save_as_popup.is_some() {
             return;
         }
 
@@ -701,26 +866,96 @@ impl Editor {
         let cols = usize::from(cols);
         let rows = usize::from(rows);
 
-        if row == 0 {
-            if let Some(menu) = self.menu_at_column(col) {
-                self.open_menu(menu);
-            } else {
-                self.active_menu = None;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if row == 0 {
+                    if let Some(menu) = self.menu_at_column(col) {
+                        self.open_menu(menu);
+                    } else {
+                        self.active_menu = None;
+                    }
+                    self.mouse_drag_anchor = None;
+                    return;
+                }
+
+                if let Some(menu) = self.active_menu {
+                    if let Some(index) = self.dropdown_item_at(menu, col, row, cols, rows) {
+                        self.active_menu_index = index;
+                        self.activate_selected_menu_item(menu);
+                        self.active_menu = None;
+                        self.active_menu_index = 0;
+                        self.mouse_drag_anchor = None;
+                        return;
+                    }
+                    self.active_menu = None;
+                    self.active_menu_index = 0;
+                }
+
+                if let Some(pos) = self.editor_position_from_mouse(col, row, cols, rows) {
+                    self.cursor = pos;
+                    self.clear_selection();
+                    self.mouse_drag_anchor = Some(pos);
+                    self.scroll();
+                } else {
+                    self.mouse_drag_anchor = None;
+                }
             }
-            return;
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(anchor) = self.mouse_drag_anchor {
+                    if let Some(pos) = self.editor_position_from_mouse(col, row, cols, rows) {
+                        self.cursor = pos;
+                        self.selection_anchor = Some(anchor);
+                        self.normalize_selection_anchor();
+                        self.active_menu = None;
+                        self.active_menu_index = 0;
+                        self.scroll();
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_drag_anchor = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn editor_position_from_mouse(
+        &self,
+        column: usize,
+        row: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Option<Position> {
+        let inner_width = cols.saturating_sub(2);
+        let text_height = rows.saturating_sub(5);
+        if text_height == 0 {
+            return None;
+        }
+        if row < 2 || row >= 2 + text_height {
+            return None;
         }
 
-        if let Some(menu) = self.active_menu {
-            if let Some(index) = self.dropdown_item_at(menu, col, row, cols, rows) {
-                self.active_menu_index = index;
-                self.activate_selected_menu_item(menu);
-                self.active_menu = None;
-                self.active_menu_index = 0;
-                return;
-            }
-            self.active_menu = None;
-            self.active_menu_index = 0;
+        let gutter = self.gutter_width();
+        let body_width = self.editor_body_width(inner_width);
+        let editor_end = 1 + gutter + body_width;
+        if column < 1 || column >= editor_end {
+            return None;
         }
+
+        let file_row = cmp::min(
+            self.offset.y + (row - 2),
+            self.doc.line_count().saturating_sub(1),
+        );
+        let visual_x = if column <= gutter {
+            0
+        } else {
+            self.offset.x + column - (gutter + 1)
+        };
+        let line_len = self.doc.line_char_len(file_row);
+        Some(Position {
+            x: cmp::min(visual_x, line_len),
+            y: file_row,
+        })
     }
 
     fn menu_at_column(&self, column: usize) -> Option<MenuKind> {
@@ -734,7 +969,7 @@ impl Editor {
     }
 
     fn menu_item_bounds() -> Vec<(MenuKind, usize, usize)> {
-        let mut x = " redit ".chars().count();
+        let mut x = format!(" {APP_NAME} v{APP_VERSION} ").chars().count();
         let mut bounds = Vec::with_capacity(MENU_ITEMS.len());
         for (index, (menu, label)) in MENU_ITEMS.iter().enumerate() {
             x += if index == 0 { 1 } else { 2 };
@@ -888,39 +1123,659 @@ impl Editor {
     fn invoke_menu_action(&mut self, action: MenuAction) {
         match action {
             MenuAction::Save => self.save(),
+            MenuAction::SaveAs => self.open_save_as_popup(),
             MenuAction::Quit => self.quit(),
-            MenuAction::Undo => {
-                self.status = StatusMessage::new("Undo is not implemented yet.");
-            }
-            MenuAction::Redo => {
-                self.status = StatusMessage::new("Redo is not implemented yet.");
-            }
-            MenuAction::Cut => {
-                self.status = StatusMessage::new("Cut is not implemented yet.");
-            }
-            MenuAction::Copy => {
-                self.status = StatusMessage::new("Copy is not implemented yet.");
-            }
-            MenuAction::Paste => {
-                self.status = StatusMessage::new("Paste is not implemented yet.");
-            }
-            MenuAction::Find => {
-                self.status = StatusMessage::new("Find is not implemented yet.");
-            }
-            MenuAction::Replace => {
-                self.status = StatusMessage::new("Replace is not implemented yet.");
-            }
+            MenuAction::Undo => self.undo(),
+            MenuAction::Redo => self.redo(),
+            MenuAction::Cut => self.cut_current_line(),
+            MenuAction::Copy => self.copy_current_line(),
+            MenuAction::Paste => self.paste_clipboard(),
+            MenuAction::Find => self.open_find_popup(),
+            MenuAction::Replace => self.open_replace_popup(),
             MenuAction::TogglePreview => self.toggle_preview(),
             MenuAction::Keybindings => {
                 self.status = StatusMessage::new(
-                    "Menus: Alt-F/E/S/H, arrows, Enter, Esc. Shortcuts: Ctrl-S/Q/Z/Y/X/C/V/F/R/P.",
+                    "Shortcuts: Ctrl-S save, Ctrl-Shift-S save as, Ctrl-Q quit, Ctrl-P preview.",
                 );
             }
             MenuAction::About => {
-                self.status =
-                    StatusMessage::new("redit: terminal markup editor prototype in Rust.");
+                self.status = StatusMessage::new(format!(
+                    "{APP_NAME} v{APP_VERSION}: terminal markup editor prototype in Rust."
+                ));
             }
         }
+    }
+
+    fn current_snapshot(&self) -> EditorSnapshot {
+        EditorSnapshot {
+            lines: self.doc.lines.clone(),
+            cursor: self.cursor,
+            offset: self.offset,
+            selection_anchor: self.selection_anchor,
+            modified: self.doc.modified,
+        }
+    }
+
+    fn restore_snapshot(&mut self, snapshot: EditorSnapshot) {
+        self.doc.lines = if snapshot.lines.is_empty() {
+            vec![String::new()]
+        } else {
+            snapshot.lines
+        };
+        self.doc.modified = snapshot.modified;
+        self.cursor = snapshot.cursor;
+        self.offset = snapshot.offset;
+        self.selection_anchor = snapshot.selection_anchor;
+        self.mouse_drag_anchor = None;
+        self.clamp_cursor_to_document();
+        self.normalize_selection_anchor();
+    }
+
+    fn push_undo_snapshot(&mut self) {
+        let snapshot = self.current_snapshot();
+        if self.undo_stack.last() == Some(&snapshot) {
+            return;
+        }
+        self.undo_stack.push(snapshot);
+    }
+
+    fn begin_edit(&mut self) {
+        self.push_undo_snapshot();
+        self.redo_stack.clear();
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    fn normalized_selection(&self) -> Option<SelectionRange> {
+        let anchor = self.selection_anchor?;
+        if anchor == self.cursor {
+            return None;
+        }
+        if (anchor.y, anchor.x) <= (self.cursor.y, self.cursor.x) {
+            Some(SelectionRange {
+                start: anchor,
+                end: self.cursor,
+            })
+        } else {
+            Some(SelectionRange {
+                start: self.cursor,
+                end: anchor,
+            })
+        }
+    }
+
+    fn normalize_selection_anchor(&mut self) {
+        if self.selection_anchor == Some(self.cursor) {
+            self.selection_anchor = None;
+        }
+    }
+
+    fn selection_range_for_line(&self, line_idx: usize, line_len: usize) -> Option<(usize, usize)> {
+        let selection = self.normalized_selection()?;
+        if line_idx < selection.start.y || line_idx > selection.end.y {
+            return None;
+        }
+        let start = if line_idx == selection.start.y {
+            selection.start.x
+        } else {
+            0
+        };
+        let end = if line_idx == selection.end.y {
+            selection.end.x
+        } else {
+            line_len
+        };
+        (start < end).then_some((cmp::min(start, line_len), cmp::min(end, line_len)))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.normalized_selection()?;
+        if selection.start.y == selection.end.y {
+            let line = self.doc.line(selection.start.y)?;
+            return Some(slice_chars(line, selection.start.x, selection.end.x));
+        }
+
+        let mut parts = Vec::new();
+        let first_line = self.doc.line(selection.start.y)?;
+        parts.push(slice_chars(
+            first_line,
+            selection.start.x,
+            first_line.chars().count(),
+        ));
+        for line_idx in selection.start.y + 1..selection.end.y {
+            parts.push(self.doc.line(line_idx)?.clone());
+        }
+        let last_line = self.doc.line(selection.end.y)?;
+        parts.push(slice_chars(last_line, 0, selection.end.x));
+        Some(parts.join("\n"))
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let Some(selection) = self.normalized_selection() else {
+            return false;
+        };
+
+        if selection.start.y == selection.end.y {
+            if let Some(line) = self.doc.lines.get_mut(selection.start.y) {
+                let start = byte_index_for_char(line, selection.start.x);
+                let end = byte_index_for_char(line, selection.end.x);
+                line.replace_range(start..end, "");
+            }
+        } else {
+            let first_prefix = self
+                .doc
+                .line(selection.start.y)
+                .map(|line| slice_chars(line, 0, selection.start.x))
+                .unwrap_or_default();
+            let last_suffix = self
+                .doc
+                .line(selection.end.y)
+                .map(|line| slice_chars(line, selection.end.x, line.chars().count()))
+                .unwrap_or_default();
+
+            if let Some(line) = self.doc.lines.get_mut(selection.start.y) {
+                *line = format!("{first_prefix}{last_suffix}");
+            }
+
+            if selection.start.y < selection.end.y && selection.end.y < self.doc.lines.len() {
+                self.doc
+                    .lines
+                    .drain(selection.start.y + 1..=selection.end.y);
+            }
+        }
+
+        if self.doc.lines.is_empty() {
+            self.doc.lines.push(String::new());
+        }
+        self.doc.modified = true;
+        self.cursor = selection.start;
+        self.clear_selection();
+        self.clamp_cursor_to_document();
+        true
+    }
+
+    fn apply_selection_for_move(&mut self, old_cursor: Position, extend: bool) {
+        if extend {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(old_cursor);
+            }
+            self.normalize_selection_anchor();
+        } else {
+            self.clear_selection();
+        }
+    }
+
+    fn clamp_cursor_to_document(&mut self) {
+        let bottom = self.doc.line_count().saturating_sub(1);
+        self.cursor.y = cmp::min(self.cursor.y, bottom);
+        self.cursor.x = cmp::min(self.cursor.x, self.doc.line_char_len(self.cursor.y));
+    }
+
+    fn undo(&mut self) {
+        let Some(snapshot) = self.undo_stack.pop() else {
+            self.status = StatusMessage::new("Nothing to undo.");
+            return;
+        };
+
+        self.redo_stack.push(self.current_snapshot());
+        self.restore_snapshot(snapshot);
+        self.status = StatusMessage::new("Undo.");
+    }
+
+    fn redo(&mut self) {
+        let Some(snapshot) = self.redo_stack.pop() else {
+            self.status = StatusMessage::new("Nothing to redo.");
+            return;
+        };
+
+        self.undo_stack.push(self.current_snapshot());
+        self.restore_snapshot(snapshot);
+        self.status = StatusMessage::new("Redo.");
+    }
+
+    fn copy_current_line(&mut self) {
+        if let Some(selected) = self.selected_text() {
+            self.clipboard = selected;
+            self.status = StatusMessage::new("Copied selection.");
+            return;
+        }
+
+        let Some(line) = self.doc.line(self.cursor.y) else {
+            self.status = StatusMessage::new("No line to copy.");
+            return;
+        };
+        self.clipboard = line.clone();
+        self.status = StatusMessage::new("Copied current line.");
+    }
+
+    fn cut_current_line(&mut self) {
+        if let Some(selected) = self.selected_text() {
+            self.begin_edit();
+            self.clipboard = selected;
+            self.delete_selection();
+            self.status = StatusMessage::new("Cut selection.");
+            return;
+        }
+
+        if self.doc.line_count() == 0 {
+            self.status = StatusMessage::new("No line to cut.");
+            return;
+        }
+
+        self.begin_edit();
+        let removed = if self.doc.line_count() == 1 {
+            let value = self.doc.lines[0].clone();
+            self.doc.lines[0].clear();
+            value
+        } else {
+            self.doc.lines.remove(self.cursor.y)
+        };
+        self.clipboard = removed;
+        if self.cursor.y >= self.doc.line_count() {
+            self.cursor.y = self.doc.line_count().saturating_sub(1);
+        }
+        self.clamp_cursor_x();
+        self.doc.modified = true;
+        self.status = StatusMessage::new("Cut current line.");
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            self.status = StatusMessage::new("Clipboard is empty.");
+            return;
+        }
+
+        self.begin_edit();
+        self.delete_selection();
+        let text = self.clipboard.clone();
+        self.insert_text_at_cursor(&text);
+        self.status = StatusMessage::new("Pasted clipboard.");
+    }
+
+    fn insert_text_at_cursor(&mut self, text: &str) {
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.doc.insert_newline(self.cursor);
+                self.cursor.y += 1;
+                self.cursor.x = 0;
+            } else {
+                self.doc.insert_char(self.cursor, ch);
+                self.cursor.x += 1;
+            }
+        }
+    }
+
+    fn open_save_as_popup(&mut self) {
+        let default_path = self
+            .doc
+            .file_path
+            .as_ref()
+            .map_or_else(|| "redit.md".to_string(), |path| path.display().to_string());
+        let default_cursor = default_path.chars().count();
+        self.save_as_popup = Some(SaveAsPopupState {
+            path_input: default_path,
+            cursor: default_cursor,
+            select_all: true,
+        });
+        self.search_popup = None;
+        self.active_menu = None;
+        self.active_menu_index = 0;
+    }
+
+    fn handle_save_as_popup_key(&mut self, key: KeyEvent) -> bool {
+        if self.save_as_popup.is_none() {
+            return false;
+        }
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.save_as_popup = None;
+                self.status = StatusMessage::new("Save As cancelled.");
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                self.save_as_backspace();
+            }
+            KeyEvent {
+                code: KeyCode::Delete,
+                ..
+            } => {
+                self.save_as_delete();
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => {
+                if let Some(popup) = self.save_as_popup.as_mut() {
+                    popup.select_all = false;
+                    popup.cursor = popup.cursor.saturating_sub(1);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => {
+                if let Some(popup) = self.save_as_popup.as_mut() {
+                    popup.select_all = false;
+                    popup.cursor = cmp::min(popup.cursor + 1, popup.path_input.chars().count());
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => {
+                if let Some(popup) = self.save_as_popup.as_mut() {
+                    popup.select_all = false;
+                    popup.cursor = 0;
+                }
+            }
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => {
+                if let Some(popup) = self.save_as_popup.as_mut() {
+                    popup.select_all = false;
+                    popup.cursor = popup.path_input.chars().count();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                self.submit_save_as_popup();
+            }
+            KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                let paste_text = self.clipboard.clone();
+                if !paste_text.is_empty() {
+                    self.save_as_insert_text(&paste_text);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(popup) = self.save_as_popup.as_mut() {
+                    popup.select_all = true;
+                    popup.cursor = popup.path_input.chars().count();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                let mut buffer = String::new();
+                buffer.push(c);
+                self.save_as_insert_text(&buffer);
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    fn save_as_insert_text(&mut self, text: &str) {
+        if let Some(popup) = self.save_as_popup.as_mut() {
+            if popup.select_all {
+                popup.path_input.clear();
+                popup.cursor = 0;
+                popup.select_all = false;
+            }
+
+            let byte_idx = byte_index_for_char(&popup.path_input, popup.cursor);
+            popup.path_input.insert_str(byte_idx, text);
+            popup.cursor += text.chars().count();
+        }
+    }
+
+    fn save_as_backspace(&mut self) {
+        if let Some(popup) = self.save_as_popup.as_mut() {
+            if popup.select_all {
+                popup.path_input.clear();
+                popup.cursor = 0;
+                popup.select_all = false;
+                return;
+            }
+
+            if popup.cursor > 0 {
+                remove_char_at(&mut popup.path_input, popup.cursor - 1);
+                popup.cursor -= 1;
+            }
+        }
+    }
+
+    fn save_as_delete(&mut self) {
+        if let Some(popup) = self.save_as_popup.as_mut() {
+            if popup.select_all {
+                popup.path_input.clear();
+                popup.cursor = 0;
+                popup.select_all = false;
+                return;
+            }
+
+            remove_char_at(&mut popup.path_input, popup.cursor);
+        }
+    }
+
+    fn submit_save_as_popup(&mut self) {
+        let Some(popup) = self.save_as_popup.clone() else {
+            return;
+        };
+        let path_text = popup.path_input.trim();
+        if path_text.is_empty() {
+            self.status = StatusMessage::new("Save As path cannot be empty.");
+            return;
+        }
+
+        match self.doc.save_as(PathBuf::from(path_text)) {
+            Ok(path) => {
+                self.status = StatusMessage::new(format!("Saved {}", path.display()));
+                self.quit_warning_countdown = 1;
+                self.save_as_popup = None;
+            }
+            Err(err) => {
+                self.status = StatusMessage::new(format!("Save As failed: {err}"));
+            }
+        }
+    }
+
+    fn open_find_popup(&mut self) {
+        self.search_popup = Some(SearchPopupState::find(&self.last_search_query));
+        self.save_as_popup = None;
+        self.active_menu = None;
+        self.active_menu_index = 0;
+    }
+
+    fn open_replace_popup(&mut self) {
+        self.search_popup = Some(SearchPopupState::replace(&self.last_search_query));
+        self.save_as_popup = None;
+        self.active_menu = None;
+        self.active_menu_index = 0;
+    }
+
+    fn handle_search_popup_key(&mut self, key: KeyEvent) -> bool {
+        if self.search_popup.is_none() {
+            return false;
+        }
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.search_popup = None;
+                self.status = StatusMessage::new("Search cancelled.");
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Up, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                if let Some(popup) = self.search_popup.as_mut() {
+                    if popup.mode == SearchPopupMode::Replace {
+                        popup.active_field = match popup.active_field {
+                            SearchPopupField::Find => SearchPopupField::Replace,
+                            SearchPopupField::Replace => SearchPopupField::Find,
+                        };
+                    }
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                if let Some(popup) = self.search_popup.as_mut() {
+                    popup.active_field_mut().pop();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                self.submit_search_popup();
+            }
+            KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                let paste_text = self.clipboard.clone();
+                if let Some(popup) = self.search_popup.as_mut() {
+                    popup.active_field_mut().push_str(&paste_text);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                if let Some(popup) = self.search_popup.as_mut() {
+                    popup.active_field_mut().push(c);
+                }
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    fn submit_search_popup(&mut self) {
+        let Some(popup) = self.search_popup.clone() else {
+            return;
+        };
+
+        match popup.mode {
+            SearchPopupMode::Find => {
+                if popup.find_input.trim().is_empty() {
+                    self.status = StatusMessage::new("Find text cannot be empty.");
+                    return;
+                }
+                self.last_search_query = popup.find_input.clone();
+                self.find_next_occurrence(&popup.find_input);
+                self.search_popup = None;
+            }
+            SearchPopupMode::Replace => {
+                if popup.find_input.trim().is_empty() {
+                    self.status = StatusMessage::new("Find text cannot be empty.");
+                    return;
+                }
+                if popup.active_field == SearchPopupField::Find {
+                    if let Some(state) = self.search_popup.as_mut() {
+                        state.active_field = SearchPopupField::Replace;
+                    }
+                    return;
+                }
+
+                self.last_search_query = popup.find_input.clone();
+                self.replace_all_occurrences(&popup.find_input, &popup.replace_input);
+                self.search_popup = None;
+            }
+        }
+    }
+
+    fn find_next_occurrence(&mut self, query: &str) {
+        let query_chars: Vec<char> = query.chars().collect();
+        if query_chars.is_empty() {
+            self.status = StatusMessage::new("Find text cannot be empty.");
+            return;
+        }
+
+        let start_line = self.cursor.y;
+        let start_col = self.cursor.x.saturating_add(1);
+        let found = self
+            .find_from(query, start_line, start_col)
+            .or_else(|| self.find_from(query, 0, 0));
+
+        if let Some(pos) = found {
+            self.clear_selection();
+            self.cursor = pos;
+            self.scroll();
+            self.status = StatusMessage::new(format!(
+                "Found \"{query}\" at Ln {}, Col {}.",
+                pos.y + 1,
+                pos.x + 1
+            ));
+        } else {
+            self.status = StatusMessage::new(format!("No matches for \"{query}\"."));
+        }
+    }
+
+    fn find_from(&self, query: &str, start_line: usize, start_col: usize) -> Option<Position> {
+        if query.is_empty() {
+            return None;
+        }
+
+        for line_idx in start_line..self.doc.line_count() {
+            let line = self.doc.line(line_idx)?;
+            let col_start = if line_idx == start_line { start_col } else { 0 };
+            if let Some(col) = find_substring_at_char(line, query, col_start) {
+                return Some(Position {
+                    x: col,
+                    y: line_idx,
+                });
+            }
+        }
+        None
+    }
+
+    fn replace_all_occurrences(&mut self, query: &str, replacement: &str) {
+        if query.is_empty() {
+            self.status = StatusMessage::new("Find text cannot be empty.");
+            return;
+        }
+
+        let mut total = 0usize;
+        for line in &self.doc.lines {
+            total += line.match_indices(query).count();
+        }
+        if total == 0 {
+            self.status = StatusMessage::new(format!("No matches for \"{query}\"."));
+            return;
+        }
+
+        self.begin_edit();
+        for line in &mut self.doc.lines {
+            if line.contains(query) {
+                *line = line.replace(query, replacement);
+            }
+        }
+        self.doc.modified = true;
+        self.clamp_cursor_to_document();
+        self.status = StatusMessage::new(format!("Replaced {total} occurrence(s) of \"{query}\"."));
     }
 
     fn toggle_preview(&mut self) {
@@ -1071,11 +1926,13 @@ impl Editor {
     }
 
     fn insert_char(&mut self, c: char) {
+        self.delete_selection();
         self.doc.insert_char(self.cursor, c);
         self.cursor.x += 1;
     }
 
     fn insert_newline(&mut self) {
+        self.delete_selection();
         let continuation = self.markdown_continuation();
         self.doc.insert_newline(self.cursor);
         self.cursor.y += 1;
@@ -1094,9 +1951,19 @@ impl Editor {
     }
 
     fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if let Some(pos) = self.doc.backspace(self.cursor) {
             self.cursor = pos;
         }
+    }
+
+    fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+        self.doc.delete_forward(self.cursor);
     }
 
     fn quit(&mut self) {
@@ -1131,6 +1998,12 @@ impl Editor {
         }
     }
 
+    fn move_cursor_left_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.move_cursor_left();
+        self.apply_selection_for_move(old, extend);
+    }
+
     fn move_cursor_right(&mut self) {
         let line_len = self.doc.line_char_len(self.cursor.y);
         if self.cursor.x < line_len {
@@ -1143,11 +2016,23 @@ impl Editor {
         }
     }
 
+    fn move_cursor_right_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.move_cursor_right();
+        self.apply_selection_for_move(old, extend);
+    }
+
     fn move_cursor_up(&mut self) {
         if self.cursor.y > 0 {
             self.cursor.y -= 1;
             self.clamp_cursor_x();
         }
+    }
+
+    fn move_cursor_up_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.move_cursor_up();
+        self.apply_selection_for_move(old, extend);
     }
 
     fn move_cursor_down(&mut self) {
@@ -1157,10 +2042,22 @@ impl Editor {
         }
     }
 
+    fn move_cursor_down_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.move_cursor_down();
+        self.apply_selection_for_move(old, extend);
+    }
+
     fn page_up(&mut self) {
         let height = self.text_area_height();
         self.cursor.y = self.cursor.y.saturating_sub(height);
         self.clamp_cursor_x();
+    }
+
+    fn page_up_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.page_up();
+        self.apply_selection_for_move(old, extend);
     }
 
     fn page_down(&mut self) {
@@ -1168,6 +2065,24 @@ impl Editor {
         let bottom = self.doc.line_count().saturating_sub(1);
         self.cursor.y = cmp::min(self.cursor.y + height, bottom);
         self.clamp_cursor_x();
+    }
+
+    fn page_down_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.page_down();
+        self.apply_selection_for_move(old, extend);
+    }
+
+    fn home_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.cursor.x = 0;
+        self.apply_selection_for_move(old, extend);
+    }
+
+    fn end_with_selection(&mut self, extend: bool) {
+        let old = self.cursor;
+        self.cursor.x = self.doc.line_char_len(self.cursor.y);
+        self.apply_selection_for_move(old, extend);
     }
 
     fn clamp_cursor_x(&mut self) {
@@ -1222,6 +2137,7 @@ impl Editor {
         in_code_block: bool,
         setext_heading: bool,
         line_bg: Color,
+        selected_range: Option<(usize, usize)>,
     ) -> (Vec<Span<'static>>, usize, bool) {
         let chars: Vec<char> = line.chars().collect();
         let indented_code = !in_code_block && is_indented_code_line(line);
@@ -1233,18 +2149,21 @@ impl Editor {
         let mut rendered = 0usize;
 
         if start < end {
-            let mut current_style = styles[start];
+            let mut current_style = style_for_markdown_char(styles[start], line_bg);
+            if selected_range.is_some_and(|(s, e)| (s..e).contains(&start)) {
+                current_style = apply_selection_style(current_style);
+            }
             let mut segment = String::new();
 
             for idx in start..end {
-                let style = styles[idx];
+                let mut style = style_for_markdown_char(styles[idx], line_bg);
+                if selected_range.is_some_and(|(s, e)| (s..e).contains(&idx)) {
+                    style = apply_selection_style(style);
+                }
                 if style != current_style {
                     let text = std::mem::take(&mut segment);
                     rendered += text.chars().count();
-                    spans.push(Span::styled(
-                        text,
-                        md_style_to_style(current_style, line_bg),
-                    ));
+                    spans.push(Span::styled(text, current_style));
                     current_style = style;
                 }
                 segment.push(chars[idx]);
@@ -1252,10 +2171,7 @@ impl Editor {
 
             if !segment.is_empty() {
                 rendered += segment.chars().count();
-                spans.push(Span::styled(
-                    segment,
-                    md_style_to_style(current_style, line_bg),
-                ));
+                spans.push(Span::styled(segment, current_style));
             }
         }
 
@@ -1304,6 +2220,7 @@ impl Editor {
                     in_code_block,
                     setext_heading,
                     line_bg,
+                    self.selection_range_for_line(file_row, line.chars().count()),
                 );
                 spans.append(&mut content_spans);
                 if rendered < body_width {
@@ -1341,20 +2258,32 @@ impl Editor {
         for screen_row in 0..text_height {
             let file_row = self.offset.y + screen_row;
             if let Some(preview_line) = self.preview_cache_lines.get(file_row) {
-                let visible =
-                    clip_to_char_width(&strip_ansi_escape_codes(preview_line), preview_width);
-                let visible_width = visible.chars().count();
-                let mut spans = vec![Span::styled(
-                    visible,
-                    Style::default().fg(CRT_FG).bg(CRT_BG),
-                )];
-                if visible_width < preview_width {
-                    spans.push(Span::styled(
-                        " ".repeat(preview_width - visible_width),
+                if self.preview_backend == PreviewBackend::Glow {
+                    let mut line = ansi_to_line_clipped(preview_line, preview_width);
+                    let visible_width = line_char_width(&line);
+                    if visible_width < preview_width {
+                        line.spans.push(Span::styled(
+                            " ".repeat(preview_width - visible_width),
+                            Style::default().fg(CRT_FG).bg(CRT_BG),
+                        ));
+                    }
+                    lines.push(line);
+                } else {
+                    let visible =
+                        clip_to_char_width(&strip_ansi_escape_codes(preview_line), preview_width);
+                    let visible_width = visible.chars().count();
+                    let mut spans = vec![Span::styled(
+                        visible,
                         Style::default().fg(CRT_FG).bg(CRT_BG),
-                    ));
+                    )];
+                    if visible_width < preview_width {
+                        spans.push(Span::styled(
+                            " ".repeat(preview_width - visible_width),
+                            Style::default().fg(CRT_FG).bg(CRT_BG),
+                        ));
+                    }
+                    lines.push(Line::from(spans));
                 }
-                lines.push(Line::from(spans));
             } else if preview_width > 0 {
                 let mut spans = vec![Span::styled(
                     "~",
@@ -1392,7 +2321,7 @@ impl Editor {
         let mut spans = Vec::new();
         let mut used = 0usize;
 
-        let title = " redit ";
+        let title = format!(" {APP_NAME} v{APP_VERSION} ");
         let title_width = title.chars().count();
         if title_width <= cols {
             spans.push(Span::styled(title, base));
@@ -1493,6 +2422,197 @@ impl Editor {
             .collect()
     }
 
+    fn build_save_as_popup_render(&self, cols: usize, rows: usize) -> Option<SaveAsPopupRender> {
+        let popup = self.save_as_popup.as_ref()?;
+        if cols < 28 || rows < 8 {
+            return None;
+        }
+
+        let max_width = cols.saturating_sub(4);
+        let width = cmp::max(28, cmp::min(72, max_width));
+        let height = cmp::max(6, cmp::min(7, rows.saturating_sub(2)));
+        if width >= cols || height >= rows {
+            return None;
+        }
+
+        let rect = Rect::new(
+            ((cols - width) / 2) as u16,
+            ((rows - height) / 2) as u16,
+            width as u16,
+            height as u16,
+        );
+        let inner_width = width.saturating_sub(2);
+        let inner_height = height.saturating_sub(2);
+        let label_style = Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG);
+        let hint_style = Style::default().fg(CRT_DIM_FG).bg(CRT_MENU_BG);
+        let input_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_ACTIVE_BG);
+        let selected_input_style = Style::default().fg(CRT_SELECTION_FG).bg(CRT_SELECTION_BG);
+        let field_style = if popup.select_all && !popup.path_input.is_empty() {
+            selected_input_style
+        } else {
+            input_style
+        };
+
+        let mut lines = vec![
+            Line::styled(
+                pad_or_clip_to_char_width(" Path:", inner_width),
+                label_style,
+            ),
+            Line::styled(
+                pad_or_clip_to_char_width(&popup.path_input, inner_width),
+                field_style,
+            ),
+            Line::styled(
+                pad_or_clip_to_char_width(
+                    " Enter: save  Ctrl+A: select all  Esc: cancel",
+                    inner_width,
+                ),
+                hint_style,
+            ),
+        ];
+        while lines.len() < inner_height {
+            lines.push(Line::styled(
+                pad_or_clip_to_char_width("", inner_width),
+                Style::default().bg(CRT_MENU_BG),
+            ));
+        }
+        lines.truncate(inner_height);
+
+        let cursor_x = rect.x + 1 + cmp::min(popup.cursor, inner_width.saturating_sub(1)) as u16;
+        let cursor_y = rect.y + 2;
+
+        Some(SaveAsPopupRender {
+            rect,
+            title: " Save As ".to_string(),
+            lines,
+            cursor: (cursor_x, cursor_y),
+        })
+    }
+
+    fn build_search_popup_render(&self, cols: usize, rows: usize) -> Option<SearchPopupRender> {
+        let popup = self.search_popup.as_ref()?;
+        if cols < 24 || rows < 8 {
+            return None;
+        }
+
+        let max_width = cols.saturating_sub(4);
+        let desired_width = match popup.mode {
+            SearchPopupMode::Find => 56,
+            SearchPopupMode::Replace => 66,
+        };
+        let width = cmp::max(24, cmp::min(desired_width, max_width));
+        let desired_height = match popup.mode {
+            SearchPopupMode::Find => 7,
+            SearchPopupMode::Replace => 9,
+        };
+        let height = cmp::max(6, cmp::min(desired_height, rows.saturating_sub(2)));
+        if width >= cols || height >= rows {
+            return None;
+        }
+
+        let rect = Rect::new(
+            ((cols - width) / 2) as u16,
+            ((rows - height) / 2) as u16,
+            width as u16,
+            height as u16,
+        );
+        let inner_width = width.saturating_sub(2);
+        let inner_height = height.saturating_sub(2);
+        let label_style = Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG);
+        let hint_style = Style::default().fg(CRT_DIM_FG).bg(CRT_MENU_BG);
+        let active_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_ACTIVE_BG);
+        let inactive_style = Style::default().fg(CRT_FG).bg(CRT_INPUT_BG);
+
+        let field_line = |value: &str, is_active: bool| -> Line<'static> {
+            let style = if is_active {
+                active_style
+            } else {
+                inactive_style
+            };
+            Line::styled(pad_or_clip_to_char_width(value, inner_width), style)
+        };
+
+        let mut lines = Vec::new();
+        let (title, cursor) = match popup.mode {
+            SearchPopupMode::Find => {
+                lines.push(Line::styled(
+                    pad_or_clip_to_char_width(" Find:", inner_width),
+                    label_style,
+                ));
+                lines.push(field_line(&popup.find_input, true));
+                lines.push(Line::styled(
+                    pad_or_clip_to_char_width("", inner_width),
+                    Style::default().bg(CRT_MENU_BG),
+                ));
+                lines.push(Line::styled(
+                    pad_or_clip_to_char_width(" Enter: find next   Esc: cancel", inner_width),
+                    hint_style,
+                ));
+                let cursor_x = rect.x
+                    + 1
+                    + cmp::min(
+                        popup.find_input.chars().count(),
+                        inner_width.saturating_sub(1),
+                    ) as u16;
+                let cursor_y = rect.y + 2;
+                (" Find ".to_string(), (cursor_x, cursor_y))
+            }
+            SearchPopupMode::Replace => {
+                lines.push(Line::styled(
+                    pad_or_clip_to_char_width(" Find:", inner_width),
+                    label_style,
+                ));
+                lines.push(field_line(
+                    &popup.find_input,
+                    popup.active_field == SearchPopupField::Find,
+                ));
+                lines.push(Line::styled(
+                    pad_or_clip_to_char_width(" Replace:", inner_width),
+                    label_style,
+                ));
+                lines.push(field_line(
+                    &popup.replace_input,
+                    popup.active_field == SearchPopupField::Replace,
+                ));
+                lines.push(Line::styled(
+                    pad_or_clip_to_char_width("", inner_width),
+                    Style::default().bg(CRT_MENU_BG),
+                ));
+                lines.push(Line::styled(
+                    pad_or_clip_to_char_width(
+                        " Tab: next field   Enter: apply   Esc: cancel",
+                        inner_width,
+                    ),
+                    hint_style,
+                ));
+                let (active_value, row_offset) = match popup.active_field {
+                    SearchPopupField::Find => (&popup.find_input, 2u16),
+                    SearchPopupField::Replace => (&popup.replace_input, 4u16),
+                };
+                let cursor_x = rect.x
+                    + 1
+                    + cmp::min(active_value.chars().count(), inner_width.saturating_sub(1)) as u16;
+                let cursor_y = rect.y + row_offset;
+                (" Replace ".to_string(), (cursor_x, cursor_y))
+            }
+        };
+
+        while lines.len() < inner_height {
+            lines.push(Line::styled(
+                pad_or_clip_to_char_width("", inner_width),
+                Style::default().bg(CRT_MENU_BG),
+            ));
+        }
+        lines.truncate(inner_height);
+
+        Some(SearchPopupRender {
+            rect,
+            title,
+            lines,
+            cursor,
+        })
+    }
+
     fn refresh_screen(&mut self) -> io::Result<()> {
         let (cols, rows) = terminal::size()?;
         let cols_usize = usize::from(cols);
@@ -1518,11 +2638,22 @@ impl Editor {
             self.dropdown_rect(menu, cols_usize, rows_usize)
                 .map(|rect| (rect, self.dropdown_lines(menu, rect)))
         });
+        let save_as_popup = self.build_save_as_popup_render(cols_usize, rows_usize);
+        let search_popup = self.build_search_popup_render(cols_usize, rows_usize);
         let cursor_rel_x = self.cursor.x.saturating_sub(self.offset.x) + gutter;
         let cursor_rel_y = self.cursor.y.saturating_sub(self.offset.y);
         let cursor_screen_x = cursor_rel_x + 1;
         let cursor_screen_y = cursor_rel_y + 2;
-        let show_cursor = cursor_rel_y < text_height && cursor_rel_x < inner_width;
+        let show_editor_cursor = cursor_rel_y < text_height && cursor_rel_x < inner_width;
+        let cursor_position = if let Some(popup) = &save_as_popup {
+            Some(popup.cursor)
+        } else if let Some(popup) = &search_popup {
+            Some(popup.cursor)
+        } else if show_editor_cursor {
+            Some((cursor_screen_x as u16, cursor_screen_y as u16))
+        } else {
+            None
+        };
         let message_active = self.status.created_at.elapsed() < Duration::from_secs(5);
 
         self.terminal.terminal.draw(|frame| {
@@ -1634,12 +2765,42 @@ impl Editor {
                 frame.render_widget(Paragraph::new(lines.clone()), inner);
             }
 
-            if show_cursor {
-                frame.set_cursor_position((cursor_screen_x as u16, cursor_screen_y as u16));
+            if let Some(popup) = &search_popup {
+                frame.render_widget(Clear, popup.rect);
+                let popup_block = Block::default()
+                    .title(popup.title.clone())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                frame.render_widget(popup_block.clone(), popup.rect);
+                let inner = popup_block.inner(popup.rect);
+                frame.render_widget(
+                    Paragraph::new(popup.lines.clone())
+                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    inner,
+                );
+            }
+
+            if let Some(popup) = &save_as_popup {
+                frame.render_widget(Clear, popup.rect);
+                let popup_block = Block::default()
+                    .title(popup.title.clone())
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(CRT_PANEL_BORDER).bg(CRT_MENU_BG));
+                frame.render_widget(popup_block.clone(), popup.rect);
+                let inner = popup_block.inner(popup.rect);
+                frame.render_widget(
+                    Paragraph::new(popup.lines.clone())
+                        .style(Style::default().fg(CRT_MENU_FG).bg(CRT_MENU_BG)),
+                    inner,
+                );
+            }
+
+            if let Some((x, y)) = cursor_position {
+                frame.set_cursor_position((x, y));
             }
         })?;
 
-        if show_cursor {
+        if cursor_position.is_some() {
             self.terminal.terminal.show_cursor()?;
         } else {
             self.terminal.terminal.hide_cursor()?;
@@ -1694,6 +2855,41 @@ fn remove_char_at(line: &mut String, char_idx: usize) -> Option<char> {
     removed
 }
 
+fn slice_chars(line: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    line.chars().skip(start).take(end - start).collect()
+}
+
+fn shift_only(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SHIFT)
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
+fn find_substring_at_char(line: &str, query: &str, start_char: usize) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
+
+    let haystack: Vec<char> = line.chars().collect();
+    let needle: Vec<char> = query.chars().collect();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    if start_char >= haystack.len() {
+        return None;
+    }
+
+    let max_start = haystack.len().saturating_sub(needle.len());
+    for idx in start_char..=max_start {
+        if haystack[idx..idx + needle.len()] == needle[..] {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 fn md_style_to_style(style: MdStyle, bg: Color) -> Style {
     match style {
         MdStyle::Normal => Style::default().fg(CRT_FG).bg(bg),
@@ -1727,6 +2923,14 @@ fn md_style_to_style(style: MdStyle, bg: Color) -> Style {
             .add_modifier(Modifier::ITALIC),
         MdStyle::HtmlTag => Style::default().fg(CRT_HTML_TAG_FG).bg(bg),
     }
+}
+
+fn style_for_markdown_char(style: MdStyle, bg: Color) -> Style {
+    md_style_to_style(style, bg)
+}
+
+fn apply_selection_style(style: Style) -> Style {
+    style.fg(CRT_SELECTION_FG).bg(CRT_SELECTION_BG)
 }
 
 fn markdown_styles_for_line(
@@ -2440,6 +3644,131 @@ fn strip_ansi_escape_codes(text: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+fn line_char_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
+}
+
+fn ansi_to_line_clipped(text: &str, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::raw(String::new());
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_style = Style::default().fg(CRT_FG).bg(CRT_BG);
+    let mut buffer = String::new();
+    let mut visible = 0usize;
+    let mut i = 0usize;
+
+    let flush = |spans: &mut Vec<Span<'static>>, buffer: &mut String, style: Style| {
+        if !buffer.is_empty() {
+            let content = std::mem::take(buffer);
+            spans.push(Span::styled(content, style));
+        }
+    };
+
+    while i < chars.len() && visible < width {
+        if chars[i] == '\u{1b}' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            flush(&mut spans, &mut buffer, current_style);
+            i += 2;
+            let mut seq = String::new();
+            while i < chars.len() {
+                let c = chars[i];
+                if c.is_ascii_alphabetic() {
+                    if c == 'm' {
+                        apply_sgr_sequence(&seq, &mut current_style);
+                    }
+                    i += 1;
+                    break;
+                }
+                seq.push(c);
+                i += 1;
+            }
+            continue;
+        }
+
+        let ch = chars[i];
+        i += 1;
+        if ch == '\n' || ch == '\r' {
+            continue;
+        }
+        buffer.push(ch);
+        visible += 1;
+    }
+    flush(&mut spans, &mut buffer, current_style);
+    Line::from(spans)
+}
+
+fn apply_sgr_sequence(seq: &str, style: &mut Style) {
+    let params: Vec<Option<u16>> = if seq.is_empty() {
+        vec![Some(0)]
+    } else {
+        seq.split(';')
+            .map(|part| {
+                if part.is_empty() {
+                    None
+                } else {
+                    part.parse::<u16>().ok()
+                }
+            })
+            .collect()
+    };
+
+    let mut i = 0usize;
+    while i < params.len() {
+        let code = params[i].unwrap_or(0);
+        match code {
+            0 => *style = Style::default().fg(CRT_FG).bg(CRT_BG),
+            1 => *style = style.add_modifier(Modifier::BOLD),
+            2 => *style = style.add_modifier(Modifier::DIM),
+            3 => *style = style.add_modifier(Modifier::ITALIC),
+            4 => *style = style.add_modifier(Modifier::UNDERLINED),
+            22 => *style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            23 => *style = style.remove_modifier(Modifier::ITALIC),
+            24 => *style = style.remove_modifier(Modifier::UNDERLINED),
+            30..=37 => *style = style.fg(Color::Indexed((code - 30) as u8)),
+            90..=97 => *style = style.fg(Color::Indexed((code - 90 + 8) as u8)),
+            39 => *style = style.fg(CRT_FG),
+            40..=47 => *style = style.bg(Color::Indexed((code - 40) as u8)),
+            100..=107 => *style = style.bg(Color::Indexed((code - 100 + 8) as u8)),
+            49 => *style = style.bg(CRT_BG),
+            38 | 48 => {
+                let is_fg = code == 38;
+                if i + 1 < params.len() {
+                    let mode = params[i + 1].unwrap_or(0);
+                    if mode == 5 && i + 2 < params.len() {
+                        if let Some(idx) = params[i + 2] {
+                            if is_fg {
+                                *style = style.fg(Color::Indexed(idx as u8));
+                            } else {
+                                *style = style.bg(Color::Indexed(idx as u8));
+                            }
+                        }
+                        i += 2;
+                    } else if mode == 2 && i + 4 < params.len() {
+                        if let (Some(r), Some(g), Some(b)) =
+                            (params[i + 2], params[i + 3], params[i + 4])
+                        {
+                            let color = Color::Rgb(r as u8, g as u8, b as u8);
+                            if is_fg {
+                                *style = style.fg(color);
+                            } else {
+                                *style = style.bg(color);
+                            }
+                        }
+                        i += 4;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
 }
 
 fn html_heading_to_markdown(line: &str) -> Option<String> {
