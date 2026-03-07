@@ -1,5 +1,7 @@
 use std::cmp;
+use std::collections::HashSet;
 use std::env;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Stdout, Write, stdout};
 use std::path::{Path, PathBuf};
@@ -60,6 +62,7 @@ enum MenuKind {
     File,
     Edit,
     Search,
+    View,
     Help,
 }
 
@@ -100,6 +103,7 @@ enum MenuAction {
     Find,
     Replace,
     TogglePreview,
+    FocusShell,
     Keybindings,
     About,
 }
@@ -108,6 +112,7 @@ const MENU_ITEMS: &[(MenuKind, &str)] = &[
     (MenuKind::File, "File"),
     (MenuKind::Edit, "Edit"),
     (MenuKind::Search, "Search"),
+    (MenuKind::View, "View"),
     (MenuKind::Help, "Help"),
 ];
 
@@ -173,16 +178,24 @@ const SEARCH_MENU_ENTRIES: &[MenuEntry] = &[
     },
 ];
 
+const VIEW_MENU_ENTRIES: &[MenuEntry] = &[
+    MenuEntry {
+        label: "Toggle Preview Ctrl+P",
+        mnemonic: 'p',
+        action: MenuAction::TogglePreview,
+    },
+    MenuEntry {
+        label: "Focus Shell  F3",
+        mnemonic: 's',
+        action: MenuAction::FocusShell,
+    },
+];
+
 const HELP_MENU_ENTRIES: &[MenuEntry] = &[
     MenuEntry {
         label: "Keybindings F1",
         mnemonic: 'k',
         action: MenuAction::Keybindings,
-    },
-    MenuEntry {
-        label: "Toggle Preview Ctrl+P",
-        mnemonic: 'p',
-        action: MenuAction::TogglePreview,
     },
     MenuEntry {
         label: "About redit v0.1",
@@ -193,6 +206,9 @@ const HELP_MENU_ENTRIES: &[MenuEntry] = &[
 
 const PREVIEW_MIN_TOTAL_WIDTH: usize = 56;
 const PREVIEW_SEPARATOR_WIDTH: usize = 1;
+const EXPLORER_WIDTH: usize = 28;
+const EXPLORER_MIN_WIDTH: usize = 8;
+const EXPLORER_SEPARATOR_WIDTH: usize = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PreviewBackend {
@@ -241,6 +257,30 @@ struct SaveAsPopupRender {
     title: String,
     lines: Vec<Line<'static>>,
     cursor: (u16, u16),
+}
+
+#[derive(Clone)]
+struct ShellPopupState {
+    input: String,
+    cursor: usize,
+    output_lines: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ExplorerEntry {
+    rendered_label: String,
+    path: PathBuf,
+    is_dir: bool,
+    expanded: bool,
+    parent: Option<PathBuf>,
+    is_parent_link: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActivePane {
+    Editor,
+    Explorer,
+    Shell,
 }
 
 impl SearchPopupState {
@@ -306,12 +346,20 @@ struct Editor {
     preview_cache_revision: u64,
     preview_backend: PreviewBackend,
     preview_error: Option<String>,
+    explorer_root: PathBuf,
+    explorer_entries: Vec<ExplorerEntry>,
+    explorer_selected: usize,
+    explorer_offset: usize,
+    explorer_expanded_dirs: HashSet<PathBuf>,
+    active_pane: ActivePane,
+    last_explorer_click: Option<(usize, Instant)>,
     clipboard: String,
     history: UndoRedoHistory<EditorSnapshot>,
     selection_anchor: Option<Position>,
     mouse_drag_anchor: Option<Position>,
     save_as_popup: Option<SaveAsPopupState>,
     search_popup: Option<SearchPopupState>,
+    shell_popup: Option<ShellPopupState>,
     last_search_query: String,
     should_quit: bool,
     quit_warning_countdown: u8,
@@ -319,19 +367,32 @@ struct Editor {
 
 impl Editor {
     fn new(file_arg: Option<PathBuf>) -> io::Result<Self> {
+        let opened_path = file_arg.as_ref().and_then(|path| {
+            if Path::new(path).exists() {
+                Some(fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+            } else {
+                None
+            }
+        });
         let doc = match file_arg {
             Some(path) if Path::new(&path).exists() => Document::open(path)?,
             Some(path) => Document::new_empty(Some(path)),
             None => Document::new_empty(None),
         };
+        let explorer_root = opened_path
+            .as_ref()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .filter(|path| !path.as_os_str().is_empty())
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
 
-        Ok(Self {
+        let mut editor = Self {
             terminal: TerminalGuard::new()?,
             doc,
             cursor: Position::default(),
             offset: Position::default(),
             status: StatusMessage::new(
-                "Alt-F/E/S/H menus | Ctrl-S save | Ctrl-Q quit | Shift+Arrows select | F1 help",
+                "F2: explorer | F3: shell | Ctrl-S save | Ctrl-Q quit | F1 help",
             ),
             active_menu: None,
             active_menu_index: 0,
@@ -341,16 +402,30 @@ impl Editor {
             preview_cache_revision: 0,
             preview_backend: PreviewBackend::Fallback,
             preview_error: None,
+            explorer_root,
+            explorer_entries: Vec::new(),
+            explorer_selected: 0,
+            explorer_offset: 0,
+            explorer_expanded_dirs: HashSet::new(),
+            active_pane: ActivePane::Editor,
+            last_explorer_click: None,
             clipboard: String::new(),
             history: UndoRedoHistory::default(),
             selection_anchor: None,
             mouse_drag_anchor: None,
             save_as_popup: None,
             search_popup: None,
+            shell_popup: Some(ShellPopupState {
+                input: String::new(),
+                cursor: 0,
+                output_lines: vec!["Run a shell command and press Enter.".to_string()],
+            }),
             last_search_query: String::new(),
             should_quit: false,
             quit_warning_countdown: 1,
-        })
+        };
+        editor.refresh_explorer_entries();
+        Ok(editor)
     }
 
     fn run(&mut self) -> io::Result<()> {
@@ -392,6 +467,13 @@ impl Editor {
             }
         }
 
+        if self.active_pane == ActivePane::Shell && self.shell_popup.is_some() {
+            if self.handle_shell_popup_key(key) {
+                self.scroll();
+                return;
+            }
+        }
+
         if let Some(menu) = self.active_menu {
             if self.handle_menu_mode_key(menu, key) {
                 self.scroll();
@@ -401,7 +483,27 @@ impl Editor {
             self.active_menu_index = 0;
         }
 
+        if self.active_pane == ActivePane::Explorer && self.handle_explorer_key(key) {
+            self.scroll();
+            return;
+        }
+
         match key {
+            KeyEvent {
+                code: KeyCode::F(3),
+                ..
+            } => self.focus_shell_pane(),
+            KeyEvent {
+                code: KeyCode::F(2),
+                ..
+            } => {
+                self.active_pane = if self.active_pane != ActivePane::Explorer {
+                    self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+                    ActivePane::Explorer
+                } else {
+                    ActivePane::Editor
+                };
+            }
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers,
@@ -559,7 +661,7 @@ impl Editor {
             }
             KeyEvent {
                 code: KeyCode::Tab, ..
-            } => {
+            } if self.active_pane == ActivePane::Editor => {
                 self.begin_edit();
                 for _ in 0..4 {
                     self.insert_char(' ');
@@ -667,6 +769,7 @@ impl Editor {
             MenuKind::File => "File menu opened",
             MenuKind::Edit => "Edit menu opened",
             MenuKind::Search => "Search menu opened",
+            MenuKind::View => "View menu opened",
             MenuKind::Help => "Help menu opened",
         });
     }
@@ -707,7 +810,35 @@ impl Editor {
                     self.active_menu_index = 0;
                 }
 
+                if let Some(shell_cursor) = self.shell_cursor_from_mouse(col, row, cols, rows) {
+                    self.active_pane = ActivePane::Shell;
+                    if let Some(shell) = self.shell_popup.as_mut() {
+                        shell.cursor = cmp::min(shell_cursor, shell.input.chars().count());
+                    }
+                    self.mouse_drag_anchor = None;
+                    return;
+                }
+
+                if let Some(index) = self.explorer_index_from_mouse(col, row, cols, rows) {
+                    self.active_pane = ActivePane::Explorer;
+                    self.explorer_selected = index;
+                    self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+                    let now = Instant::now();
+                    let double_clicked =
+                        self.last_explorer_click
+                            .is_some_and(|(last_index, last_at)| {
+                                last_index == index
+                                    && now.duration_since(last_at) <= Duration::from_millis(500)
+                            });
+                    self.last_explorer_click = Some((index, now));
+                    if double_clicked {
+                        self.open_explorer_selected();
+                    }
+                    return;
+                }
+
                 if let Some(pos) = self.editor_position_from_mouse(col, row, cols, rows) {
+                    self.active_pane = ActivePane::Editor;
                     self.cursor = pos;
                     self.clear_selection();
                     self.mouse_drag_anchor = Some(pos);
@@ -735,6 +866,55 @@ impl Editor {
         }
     }
 
+    fn shell_pane_outer_height(&self, rows: usize) -> usize {
+        let reserved = 1usize + 2usize + 3usize;
+        if rows <= reserved {
+            1
+        } else {
+            cmp::min(6, rows - reserved)
+        }
+    }
+
+    fn editor_outer_height_for_rows(&self, rows: usize) -> usize {
+        rows.saturating_sub(1 + 2 + self.shell_pane_outer_height(rows))
+    }
+
+    fn editor_text_height_for_rows(&self, rows: usize) -> usize {
+        self.editor_outer_height_for_rows(rows).saturating_sub(2)
+    }
+
+    fn shell_cursor_from_mouse(
+        &self,
+        column: usize,
+        row: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Option<usize> {
+        let shell_height = self.shell_pane_outer_height(rows);
+        if shell_height < 2 {
+            return None;
+        }
+        let shell_outer_y = 1 + self.editor_outer_height_for_rows(rows);
+        let shell_inner_y = shell_outer_y + 1;
+        if row < shell_inner_y || row >= shell_outer_y + shell_height - 1 {
+            return None;
+        }
+        if row == shell_inner_y {
+            if column < 1 || column >= cols.saturating_sub(1) {
+                return Some(0);
+            }
+            let input_offset = column - 1;
+            let prompt_width = 2usize;
+            Some(input_offset.saturating_sub(prompt_width))
+        } else {
+            Some(
+                self.shell_popup
+                    .as_ref()
+                    .map_or(0, |shell| shell.input.chars().count()),
+            )
+        }
+    }
+
     fn editor_position_from_mouse(
         &self,
         column: usize,
@@ -743,7 +923,7 @@ impl Editor {
         rows: usize,
     ) -> Option<Position> {
         let inner_width = cols.saturating_sub(2);
-        let text_height = rows.saturating_sub(5);
+        let text_height = self.editor_text_height_for_rows(rows);
         if text_height == 0 {
             return None;
         }
@@ -751,10 +931,13 @@ impl Editor {
             return None;
         }
 
+        let editor_start = self.editor_start_x(inner_width);
         let gutter = self.gutter_width();
-        let body_width = self.editor_body_width(inner_width);
-        let editor_end = 1 + gutter + body_width;
-        if column < 1 || column >= editor_end {
+        let editor_cols = self.editor_total_width(inner_width);
+        let body_width = self.editor_body_width(editor_cols);
+        let editor_left = 1 + editor_start;
+        let editor_end = editor_left + gutter + body_width;
+        if column < editor_left || column >= editor_end {
             return None;
         }
 
@@ -762,16 +945,40 @@ impl Editor {
             self.offset.y + (row - 2),
             self.doc.line_count().saturating_sub(1),
         );
-        let visual_x = if column <= gutter {
+        let visual_x = if column <= editor_left + gutter - 1 {
             0
         } else {
-            self.offset.x + column - (gutter + 1)
+            self.offset.x + column - (editor_left + gutter)
         };
         let line_len = self.doc.line_char_len(file_row);
         Some(Position {
             x: cmp::min(visual_x, line_len),
             y: file_row,
         })
+    }
+
+    fn explorer_index_from_mouse(
+        &self,
+        column: usize,
+        row: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Option<usize> {
+        let inner_width = cols.saturating_sub(2);
+        let text_height = self.editor_text_height_for_rows(rows);
+        if text_height == 0 || row < 2 || row >= 2 + text_height {
+            return None;
+        }
+
+        let (explorer_width, _) = self.explorer_layout(inner_width)?;
+        let explorer_left = 1;
+        let explorer_right = explorer_left + explorer_width;
+        if column < explorer_left || column >= explorer_right {
+            return None;
+        }
+
+        let idx = self.explorer_offset + (row - 2);
+        (idx < self.explorer_entries.len()).then_some(idx)
     }
 
     fn menu_at_column(&self, column: usize) -> Option<MenuKind> {
@@ -801,6 +1008,7 @@ impl Editor {
             MenuKind::File => FILE_MENU_ENTRIES,
             MenuKind::Edit => EDIT_MENU_ENTRIES,
             MenuKind::Search => SEARCH_MENU_ENTRIES,
+            MenuKind::View => VIEW_MENU_ENTRIES,
             MenuKind::Help => HELP_MENU_ENTRIES,
         }
     }
@@ -810,6 +1018,7 @@ impl Editor {
             'f' => Some(MenuKind::File),
             'e' => Some(MenuKind::Edit),
             's' => Some(MenuKind::Search),
+            'v' => Some(MenuKind::View),
             'h' => Some(MenuKind::Help),
             _ => None,
         }
@@ -949,9 +1158,10 @@ impl Editor {
             MenuAction::Find => self.open_find_popup(),
             MenuAction::Replace => self.open_replace_popup(),
             MenuAction::TogglePreview => self.toggle_preview(),
+            MenuAction::FocusShell => self.focus_shell_pane(),
             MenuAction::Keybindings => {
                 self.status = StatusMessage::new(
-                    "Shortcuts: Ctrl-S save, Ctrl-Shift-S save as, Ctrl-Q quit, Ctrl-P preview.",
+                    "Shortcuts: F2 explorer, F3 shell, Ctrl-S/Shift-S save, Ctrl-Q quit, Ctrl-P preview.",
                 );
             }
             MenuAction::About => {
@@ -1436,6 +1646,199 @@ impl Editor {
         }
     }
 
+    fn focus_shell_pane(&mut self) {
+        self.save_as_popup = None;
+        self.search_popup = None;
+        self.active_menu = None;
+        self.active_menu_index = 0;
+        if self.active_pane == ActivePane::Shell {
+            self.active_pane = ActivePane::Editor;
+            self.status = StatusMessage::new("Shell focus cleared.");
+        } else {
+            self.active_pane = ActivePane::Shell;
+            self.status = StatusMessage::new("Shell focused.");
+        }
+    }
+
+    fn handle_shell_popup_key(&mut self, key: KeyEvent) -> bool {
+        if self.shell_popup.is_none() {
+            return false;
+        }
+
+        match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            }
+            | KeyEvent {
+                code: KeyCode::F(3),
+                ..
+            } => {
+                self.active_pane = ActivePane::Editor;
+                self.status = StatusMessage::new("Shell focus cleared.");
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => self.submit_shell_popup(),
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => self.shell_backspace(),
+            KeyEvent {
+                code: KeyCode::Delete,
+                ..
+            } => self.shell_delete(),
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => {
+                if let Some(popup) = self.shell_popup.as_mut() {
+                    popup.cursor = popup.cursor.saturating_sub(1);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => {
+                if let Some(popup) = self.shell_popup.as_mut() {
+                    popup.cursor = cmp::min(popup.cursor + 1, popup.input.chars().count());
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => {
+                if let Some(popup) = self.shell_popup.as_mut() {
+                    popup.cursor = 0;
+                }
+            }
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => {
+                if let Some(popup) = self.shell_popup.as_mut() {
+                    popup.cursor = popup.input.chars().count();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                let paste_text = self.clipboard.clone();
+                if !paste_text.is_empty() {
+                    self.shell_insert_text(&paste_text);
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(popup) = self.shell_popup.as_mut() {
+                    popup.output_lines.clear();
+                    popup.output_lines.push("Output cleared.".to_string());
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                let mut text = String::new();
+                text.push(c);
+                self.shell_insert_text(&text);
+            }
+            _ => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    || matches!(key.code, KeyCode::F(1) | KeyCode::F(2))
+                {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    fn shell_insert_text(&mut self, text: &str) {
+        if let Some(popup) = self.shell_popup.as_mut() {
+            let byte_idx = byte_index_for_char(&popup.input, popup.cursor);
+            popup.input.insert_str(byte_idx, text);
+            popup.cursor += text.chars().count();
+        }
+    }
+
+    fn shell_backspace(&mut self) {
+        if let Some(popup) = self.shell_popup.as_mut() {
+            if popup.cursor > 0 {
+                remove_char_at(&mut popup.input, popup.cursor - 1);
+                popup.cursor -= 1;
+            }
+        }
+    }
+
+    fn shell_delete(&mut self) {
+        if let Some(popup) = self.shell_popup.as_mut() {
+            remove_char_at(&mut popup.input, popup.cursor);
+        }
+    }
+
+    fn submit_shell_popup(&mut self) {
+        let Some(popup) = self.shell_popup.clone() else {
+            return;
+        };
+        let command = popup.input.trim();
+        if command.is_empty() {
+            self.status = StatusMessage::new("Shell command cannot be empty.");
+            return;
+        }
+
+        match run_shell_command_line(command) {
+            Ok(output) => {
+                let mut lines = Vec::new();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                lines.extend(stdout.lines().map(|line| line.to_string()));
+                lines.extend(stderr.lines().map(|line| format!("! {line}")));
+                if lines.is_empty() {
+                    lines.push("(no output)".to_string());
+                }
+
+                let max_lines = 200usize;
+                if lines.len() > max_lines {
+                    lines.truncate(max_lines);
+                    lines.push(format!("... output truncated to {max_lines} lines"));
+                }
+
+                if let Some(state) = self.shell_popup.as_mut() {
+                    state.input.clear();
+                    state.cursor = 0;
+                    state.output_lines = lines;
+                }
+
+                if output.status.success() {
+                    self.status = StatusMessage::new(format!("Shell command succeeded: {command}"));
+                } else {
+                    let code = output
+                        .status
+                        .code()
+                        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+                    self.status = StatusMessage::new(format!(
+                        "Shell command failed (code {code}): {command}"
+                    ));
+                }
+            }
+            Err(err) => {
+                if let Some(state) = self.shell_popup.as_mut() {
+                    state.output_lines = vec![format!("Shell error: {err}")];
+                }
+                self.status = StatusMessage::new(format!("Shell command failed: {err}"));
+            }
+        }
+    }
+
     fn find_next_occurrence(&mut self, query: &str) {
         let query_chars: Vec<char> = query.chars().collect();
         if query_chars.is_empty() {
@@ -1515,7 +1918,10 @@ impl Editor {
             self.preview_cache_revision = 0;
             let (cols, _) = terminal::size().unwrap_or((80, 24));
             let inner_cols = usize::from(cols).saturating_sub(2);
-            if self.preview_layout(inner_cols).is_some() {
+            if self
+                .preview_layout(self.editor_total_width(inner_cols))
+                .is_some()
+            {
                 self.status = StatusMessage::new("Preview enabled (Ctrl-P to hide).");
             } else {
                 self.status =
@@ -1527,13 +1933,33 @@ impl Editor {
         self.scroll();
     }
 
-    fn preview_layout(&self, cols: usize) -> Option<(usize, usize, usize)> {
+    fn explorer_layout(&self, cols: usize) -> Option<(usize, usize)> {
+        let gutter = self.gutter_width();
+        let min_editor_width = 12usize;
+        let available = cols.saturating_sub(gutter + EXPLORER_SEPARATOR_WIDTH);
+        if available < min_editor_width + EXPLORER_MIN_WIDTH {
+            return None;
+        }
+        let width = cmp::min(EXPLORER_WIDTH, available.saturating_sub(min_editor_width));
+        Some((width, EXPLORER_SEPARATOR_WIDTH))
+    }
+
+    fn editor_start_x(&self, cols: usize) -> usize {
+        self.explorer_layout(cols)
+            .map_or(0, |(width, separator)| width + separator)
+    }
+
+    fn editor_total_width(&self, cols: usize) -> usize {
+        cols.saturating_sub(self.editor_start_x(cols))
+    }
+
+    fn preview_layout(&self, editor_cols: usize) -> Option<(usize, usize, usize)> {
         if !self.preview_mode {
             return None;
         }
 
         let gutter = self.gutter_width();
-        let total_body = cols.saturating_sub(gutter);
+        let total_body = editor_cols.saturating_sub(gutter);
         if total_body < PREVIEW_MIN_TOTAL_WIDTH {
             return None;
         }
@@ -1541,19 +1967,19 @@ impl Editor {
         let editor_width = total_body.saturating_sub(PREVIEW_SEPARATOR_WIDTH) / 2;
         let separator_x = gutter + editor_width;
         let preview_x = separator_x + PREVIEW_SEPARATOR_WIDTH;
-        let preview_width = cols.saturating_sub(preview_x);
+        let preview_width = editor_cols.saturating_sub(preview_x);
         if editor_width == 0 || preview_width == 0 {
             return None;
         }
         Some((separator_x, preview_x, preview_width))
     }
 
-    fn editor_body_width(&self, cols: usize) -> usize {
+    fn editor_body_width(&self, editor_cols: usize) -> usize {
         let gutter = self.gutter_width();
-        if let Some((separator_x, _, _)) = self.preview_layout(cols) {
+        if let Some((separator_x, _, _)) = self.preview_layout(editor_cols) {
             separator_x.saturating_sub(gutter)
         } else {
-            cols.saturating_sub(gutter)
+            editor_cols.saturating_sub(gutter)
         }
     }
 
@@ -1716,6 +2142,345 @@ impl Editor {
         }
     }
 
+    fn refresh_explorer_entries(&mut self) {
+        let selected_entry = self.explorer_entries.get(self.explorer_selected).cloned();
+        self.rebuild_explorer_entries(
+            selected_entry.as_ref().map(|entry| entry.path.clone()),
+            selected_entry.is_some_and(|entry| entry.is_parent_link),
+        );
+    }
+
+    fn rebuild_explorer_entries(
+        &mut self,
+        selected_path: Option<PathBuf>,
+        select_parent_link: bool,
+    ) {
+        self.explorer_expanded_dirs
+            .retain(|path| path.starts_with(&self.explorer_root));
+
+        let mut entries = Vec::new();
+        if let Some(parent) = self.explorer_root.parent() {
+            entries.push(ExplorerEntry {
+                rendered_label: "..".to_string(),
+                path: parent.to_path_buf(),
+                is_dir: true,
+                expanded: false,
+                parent: None,
+                is_parent_link: true,
+            });
+        }
+
+        let children = Self::read_explorer_children(&self.explorer_root);
+        let child_count = children.len();
+        for (idx, (path, name, is_dir)) in children.into_iter().enumerate() {
+            let is_last = idx + 1 == child_count;
+            self.push_explorer_tree_entry(&mut entries, path, name, is_dir, "", is_last, None);
+        }
+
+        self.explorer_entries = entries;
+        self.explorer_selected = if select_parent_link {
+            self.explorer_entries
+                .iter()
+                .position(|entry| entry.is_parent_link)
+                .unwrap_or(0)
+        } else if let Some(path) = selected_path {
+            self.explorer_entries
+                .iter()
+                .position(|entry| entry.path == path)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+    }
+
+    fn read_explorer_children(dir: &Path) -> Vec<(PathBuf, String, bool)> {
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        if let Ok(read_dir) = fs::read_dir(dir) {
+            for item in read_dir.flatten() {
+                let path = item.path();
+                let name = item.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = item
+                    .file_type()
+                    .map_or_else(|_| path.is_dir(), |ft| ft.is_dir());
+                if is_dir {
+                    dirs.push((path, name, true));
+                } else {
+                    files.push((path, name, false));
+                }
+            }
+        }
+        dirs.sort_by_key(|(_, name, _)| name.to_ascii_lowercase());
+        files.sort_by_key(|(_, name, _)| name.to_ascii_lowercase());
+        dirs.extend(files);
+        dirs
+    }
+
+    fn push_explorer_tree_entry(
+        &self,
+        out: &mut Vec<ExplorerEntry>,
+        path: PathBuf,
+        name: String,
+        is_dir: bool,
+        prefix: &str,
+        is_last: bool,
+        parent: Option<PathBuf>,
+    ) {
+        let expanded = is_dir && self.explorer_expanded_dirs.contains(&path);
+        let branch = if is_last { "`- " } else { "|- " };
+        let marker = if is_dir {
+            if expanded { "[-] " } else { "[+] " }
+        } else {
+            "    "
+        };
+        out.push(ExplorerEntry {
+            rendered_label: format!("{prefix}{branch}{marker}{name}"),
+            path: path.clone(),
+            is_dir,
+            expanded,
+            parent: parent.clone(),
+            is_parent_link: false,
+        });
+
+        if is_dir && expanded {
+            let children = Self::read_explorer_children(&path);
+            let child_count = children.len();
+            let child_prefix = format!("{prefix}{}", if is_last { "   " } else { "|  " });
+            for (idx, (child_path, child_name, child_is_dir)) in children.into_iter().enumerate() {
+                let child_is_last = idx + 1 == child_count;
+                self.push_explorer_tree_entry(
+                    out,
+                    child_path,
+                    child_name,
+                    child_is_dir,
+                    &child_prefix,
+                    child_is_last,
+                    Some(path.clone()),
+                );
+            }
+        }
+    }
+
+    fn ensure_explorer_selection_visible(&mut self, visible_rows: usize) {
+        if visible_rows == 0 {
+            self.explorer_offset = 0;
+            return;
+        }
+        if self.explorer_selected < self.explorer_offset {
+            self.explorer_offset = self.explorer_selected;
+        }
+        if self.explorer_selected >= self.explorer_offset + visible_rows {
+            self.explorer_offset = self.explorer_selected + 1 - visible_rows;
+        }
+    }
+
+    fn explorer_visible_rows(&self) -> usize {
+        self.text_area_height()
+    }
+
+    fn move_explorer_up(&mut self) {
+        if self.explorer_selected > 0 {
+            self.explorer_selected -= 1;
+        }
+        self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+    }
+
+    fn move_explorer_down(&mut self) {
+        if self.explorer_selected + 1 < self.explorer_entries.len() {
+            self.explorer_selected += 1;
+        }
+        self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+    }
+
+    fn page_explorer_up(&mut self) {
+        let step = self.explorer_visible_rows().max(1);
+        self.explorer_selected = self.explorer_selected.saturating_sub(step);
+        self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+    }
+
+    fn page_explorer_down(&mut self) {
+        let step = self.explorer_visible_rows().max(1);
+        let max_idx = self.explorer_entries.len().saturating_sub(1);
+        self.explorer_selected = cmp::min(self.explorer_selected + step, max_idx);
+        self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+    }
+
+    fn open_explorer_parent(&mut self) {
+        if let Some(parent) = self.explorer_root.parent() {
+            self.explorer_root = parent.to_path_buf();
+            self.rebuild_explorer_entries(None, true);
+            self.status = StatusMessage::new(format!("Explorer: {}", self.explorer_root.display()));
+        }
+    }
+
+    fn expand_explorer_selected(&mut self) {
+        let Some(entry) = self.explorer_entries.get(self.explorer_selected).cloned() else {
+            return;
+        };
+        if entry.is_dir && !entry.expanded && !entry.is_parent_link {
+            self.explorer_expanded_dirs.insert(entry.path.clone());
+            self.rebuild_explorer_entries(Some(entry.path), false);
+        }
+    }
+
+    fn collapse_or_select_explorer_parent(&mut self) {
+        let Some(entry) = self.explorer_entries.get(self.explorer_selected).cloned() else {
+            return;
+        };
+        if entry.is_parent_link {
+            self.open_explorer_parent();
+            return;
+        }
+        if entry.is_dir && entry.expanded {
+            self.explorer_expanded_dirs.remove(&entry.path);
+            self.rebuild_explorer_entries(Some(entry.path), false);
+            return;
+        }
+        if let Some(parent) = entry.parent {
+            self.rebuild_explorer_entries(Some(parent), false);
+        } else {
+            self.rebuild_explorer_entries(None, true);
+        }
+    }
+
+    fn open_explorer_selected(&mut self) {
+        let Some(entry) = self.explorer_entries.get(self.explorer_selected).cloned() else {
+            return;
+        };
+        if entry.is_parent_link {
+            self.open_explorer_parent();
+            return;
+        }
+        if entry.is_dir {
+            if entry.expanded {
+                self.explorer_expanded_dirs.remove(&entry.path);
+            } else {
+                self.explorer_expanded_dirs.insert(entry.path.clone());
+            }
+            self.rebuild_explorer_entries(Some(entry.path), false);
+            return;
+        }
+
+        if self.doc.modified {
+            self.status = StatusMessage::new(
+                "Unsaved changes. Save before opening another file from explorer.",
+            );
+            return;
+        }
+
+        match Document::open(entry.path.clone()) {
+            Ok(doc) => {
+                self.doc = doc;
+                self.cursor = Position::default();
+                self.offset = Position::default();
+                self.clear_selection();
+                self.active_pane = ActivePane::Editor;
+                self.quit_warning_countdown = 1;
+                self.status = StatusMessage::new(format!("Opened {}", entry.path.display()));
+                self.rebuild_explorer_entries(Some(entry.path), false);
+            }
+            Err(err) => {
+                self.status = StatusMessage::new(format!("Open failed: {err}"));
+            }
+        }
+    }
+
+    fn handle_explorer_key(&mut self, key: KeyEvent) -> bool {
+        match key {
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            }
+            | KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.active_pane = ActivePane::Editor;
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.move_explorer_up();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.move_explorer_down();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            } => {
+                self.page_explorer_up();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            } => {
+                self.page_explorer_down();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Home,
+                ..
+            } => {
+                self.explorer_selected = 0;
+                self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+                true
+            }
+            KeyEvent {
+                code: KeyCode::End, ..
+            } => {
+                self.explorer_selected = self.explorer_entries.len().saturating_sub(1);
+                self.ensure_explorer_selection_visible(self.explorer_visible_rows());
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Left,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                self.collapse_or_select_explorer_parent();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => {
+                self.expand_explorer_selected();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } => {
+                self.open_explorer_selected();
+                true
+            }
+            _ => {
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    || matches!(key.code, KeyCode::F(1) | KeyCode::F(2))
+                {
+                    false
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
     fn move_cursor_left(&mut self) {
         if self.cursor.x > 0 {
             self.cursor.x -= 1;
@@ -1820,7 +2585,7 @@ impl Editor {
 
     fn text_area_height(&self) -> usize {
         let (_, rows) = terminal::size().unwrap_or((80, 24));
-        usize::from(rows.saturating_sub(5))
+        self.editor_text_height_for_rows(usize::from(rows))
     }
 
     fn gutter_width(&self) -> usize {
@@ -1831,8 +2596,8 @@ impl Editor {
     fn scroll(&mut self) {
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let cols = usize::from(cols).saturating_sub(2);
-        let text_height = usize::from(rows.saturating_sub(5));
-        let text_width = self.editor_body_width(cols);
+        let text_height = self.editor_text_height_for_rows(usize::from(rows));
+        let text_width = self.editor_body_width(self.editor_total_width(cols));
 
         if self.cursor.y < self.offset.y {
             self.offset.y = self.cursor.y;
@@ -1922,6 +2687,18 @@ fn run_command_with_stdin(command: &mut Command, input: Option<&[u8]>) -> io::Re
         child.wait_with_output()
     } else {
         command.output()
+    }
+}
+
+fn run_shell_command_line(command_line: &str) -> io::Result<Output> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd").arg("/C").arg(command_line).output()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("sh").arg("-lc").arg(command_line).output()
     }
 }
 
