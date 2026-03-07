@@ -3,7 +3,7 @@
 `redit` is a terminal markdown editor built with Rust + Ratatui.
 It provides a multi-pane TUI with a file explorer, markdown-aware editor, optional split markdown preview, integrated terminal pane, menu bar, and popup-driven workflows.
 
-!(media/screenshot.png)
+![screenshot](media/screenshot.png)
 
 ## Current Features
 
